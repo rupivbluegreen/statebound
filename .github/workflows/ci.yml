@@ -79,6 +79,11 @@ jobs:
         env:
           STATEBOUND_DEV_AUTO_APPROVE: "true"
           STATEBOUND_ACTOR: ci-bot
+          # Phase 8 wave A: skip plan-bundle signing in the smoke. The
+          # signing path is exercised by the wave-A signing key smoke
+          # below; the rest of the smoke pre-dates signing and would
+          # otherwise need a key generated before any plan command.
+          STATEBOUND_DEV_SKIP_PLAN_SIGNATURE: "true"
         run: |
           ./bin/statebound version
           ./bin/statebound validate -f examples/payments-api/model.yaml
