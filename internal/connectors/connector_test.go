@@ -9,7 +9,11 @@ import (
 // Linux connectors live in their own subpackages; this file deliberately
 // avoids importing them so the registry test stays focused on registry
 // semantics.
+//
+// UnsupportedCollectAndCompare is embedded so fakeConnector satisfies
+// the Phase 4'+ interface without bothering with drift implementations.
 type fakeConnector struct {
+	UnsupportedCollectAndCompare
 	name    string
 	version string
 	caps    []Capability

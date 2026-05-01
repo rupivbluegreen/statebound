@@ -2733,5 +2733,465 @@ func scanPlanItem(r scannable) (*domain.PlanItem, error) {
 	return item, nil
 }
 
+// -------- Drift scans --------
+
+const driftScanColumns = "id, product_id, approved_version_id, sequence, " +
+	"connector_name, connector_version, state, source_ref, started_at, " +
+	"finished_at, initiated_by_kind, initiated_by_subject, failure_message, " +
+	"summary_hash, finding_count"
+
+const driftFindingColumns = "id, scan_id, sequence, kind, severity, " +
+	"resource_kind, resource_ref, desired, actual, diff, message, detected_at"
+
+// validDriftScanStates mirrors the CHECK constraint in
+// migrations/0007_drift.sql.
+var validDriftScanStates = map[string]struct{}{
+	"running":   {},
+	"succeeded": {},
+	"failed":    {},
+}
+
+var validDriftKinds = map[string]struct{}{
+	"missing":    {},
+	"unexpected": {},
+	"modified":   {},
+}
+
+var validDriftSeverities = map[string]struct{}{
+	"info":     {},
+	"low":      {},
+	"medium":   {},
+	"high":     {},
+	"critical": {},
+}
+
+// AppendDriftScan inserts a freshly-created drift_scans row. The row
+// is expected to be in 'running' state; subsequent UpdateDriftScan
+// flips it to a terminal state. FK violations on product_id /
+// approved_version_id surface as ErrNotFound.
+func (s *Store) AppendDriftScan(ctx context.Context, scan *domain.DriftScan) error {
+	if scan == nil {
+		return storage.ErrInvalidArgument
+	}
+	if scan.ID == "" {
+		return fmt.Errorf("%w: drift scan id", storage.ErrInvalidArgument)
+	}
+	if scan.ProductID == "" {
+		return fmt.Errorf("%w: drift scan product id", storage.ErrInvalidArgument)
+	}
+	if scan.ApprovedVersionID == "" {
+		return fmt.Errorf("%w: drift scan approved version id", storage.ErrInvalidArgument)
+	}
+	if scan.Sequence < 1 {
+		return fmt.Errorf("%w: drift scan sequence", storage.ErrInvalidArgument)
+	}
+	if scan.ConnectorName == "" {
+		return fmt.Errorf("%w: drift scan connector name", storage.ErrInvalidArgument)
+	}
+	if scan.ConnectorVersion == "" {
+		return fmt.Errorf("%w: drift scan connector version", storage.ErrInvalidArgument)
+	}
+	if _, ok := validDriftScanStates[string(scan.State)]; !ok {
+		return fmt.Errorf("%w: drift scan state %q", storage.ErrInvalidArgument, scan.State)
+	}
+	if scan.SourceRef == "" {
+		return fmt.Errorf("%w: drift scan source ref", storage.ErrInvalidArgument)
+	}
+	if scan.FindingCount < 0 {
+		return fmt.Errorf("%w: drift scan finding count", storage.ErrInvalidArgument)
+	}
+	if err := scan.InitiatedBy.Validate(); err != nil {
+		return fmt.Errorf("%w: %v", storage.ErrInvalidArgument, err)
+	}
+	if scan.StartedAt.IsZero() {
+		scan.StartedAt = time.Now().UTC()
+	}
+
+	const q = `
+INSERT INTO drift_scans (
+  id, product_id, approved_version_id, sequence, connector_name,
+  connector_version, state, source_ref, started_at, finished_at,
+  initiated_by_kind, initiated_by_subject, failure_message,
+  summary_hash, finding_count
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+`
+	var finishedAt any
+	if scan.FinishedAt != nil {
+		finishedAt = *scan.FinishedAt
+	}
+	_, err := s.q.Exec(ctx, q,
+		string(scan.ID),
+		string(scan.ProductID),
+		string(scan.ApprovedVersionID),
+		scan.Sequence,
+		scan.ConnectorName,
+		scan.ConnectorVersion,
+		string(scan.State),
+		scan.SourceRef,
+		scan.StartedAt,
+		finishedAt,
+		string(scan.InitiatedBy.Kind),
+		scan.InitiatedBy.Subject,
+		scan.FailureMessage,
+		scan.SummaryHash,
+		scan.FindingCount,
+	)
+	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) {
+			switch pgErr.Code {
+			case pgUniqueViolation:
+				return storage.ErrAlreadyExists
+			case pgForeignKeyViolation:
+				return fmt.Errorf("%w: %s", storage.ErrNotFound, pgErr.ConstraintName)
+			case pgCheckViolation:
+				return fmt.Errorf("%w: %s", storage.ErrInvalidArgument, pgErr.ConstraintName)
+			}
+		}
+		return fmt.Errorf("postgres: insert drift_scan: %w", err)
+	}
+	return nil
+}
+
+// UpdateDriftScan rewrites the mutable columns of an existing scan
+// (state, finished_at, failure_message, summary_hash, finding_count).
+// Immutable identity columns (product_id, approved_version_id, etc.)
+// are not touched. Returns ErrDriftScanNotFound if no row matches id.
+func (s *Store) UpdateDriftScan(ctx context.Context, scan *domain.DriftScan) error {
+	if scan == nil {
+		return storage.ErrInvalidArgument
+	}
+	if scan.ID == "" {
+		return fmt.Errorf("%w: drift scan id", storage.ErrInvalidArgument)
+	}
+	if _, ok := validDriftScanStates[string(scan.State)]; !ok {
+		return fmt.Errorf("%w: drift scan state %q", storage.ErrInvalidArgument, scan.State)
+	}
+	if scan.FindingCount < 0 {
+		return fmt.Errorf("%w: drift scan finding count", storage.ErrInvalidArgument)
+	}
+
+	const q = `
+UPDATE drift_scans
+   SET state           = $2,
+       finished_at     = $3,
+       failure_message = $4,
+       summary_hash    = $5,
+       finding_count   = $6
+ WHERE id = $1
+`
+	var finishedAt any
+	if scan.FinishedAt != nil {
+		finishedAt = *scan.FinishedAt
+	}
+	tag, err := s.q.Exec(ctx, q,
+		string(scan.ID),
+		string(scan.State),
+		finishedAt,
+		scan.FailureMessage,
+		scan.SummaryHash,
+		scan.FindingCount,
+	)
+	if err != nil {
+		return fmt.Errorf("postgres: update drift_scan: %w", classifyErr(err))
+	}
+	if tag.RowsAffected() == 0 {
+		return storage.ErrDriftScanNotFound
+	}
+	return nil
+}
+
+// AppendDriftFindings bulk-inserts findings against an existing scan.
+// Caller is responsible for setting Sequence (1-based, unique within
+// the scan); UNIQUE(scan_id, sequence) violations surface as
+// ErrAlreadyExists. FK violations on scan_id surface as ErrNotFound.
+//
+// An empty findings slice is a no-op (returns nil).
+func (s *Store) AppendDriftFindings(ctx context.Context, findings []*domain.DriftFinding) error {
+	if len(findings) == 0 {
+		return nil
+	}
+	for i, f := range findings {
+		if f == nil {
+			return fmt.Errorf("%w: drift_findings[%d] is nil", storage.ErrInvalidArgument, i)
+		}
+		if f.ID == "" {
+			return fmt.Errorf("%w: drift_findings[%d].id", storage.ErrInvalidArgument, i)
+		}
+		if f.ScanID == "" {
+			return fmt.Errorf("%w: drift_findings[%d].scan_id", storage.ErrInvalidArgument, i)
+		}
+		if f.Sequence < 1 {
+			return fmt.Errorf("%w: drift_findings[%d].sequence", storage.ErrInvalidArgument, i)
+		}
+		if _, ok := validDriftKinds[string(f.Kind)]; !ok {
+			return fmt.Errorf("%w: drift_findings[%d].kind %q", storage.ErrInvalidArgument, i, f.Kind)
+		}
+		if _, ok := validDriftSeverities[string(f.Severity)]; !ok {
+			return fmt.Errorf("%w: drift_findings[%d].severity %q", storage.ErrInvalidArgument, i, f.Severity)
+		}
+		if f.ResourceKind == "" {
+			return fmt.Errorf("%w: drift_findings[%d].resource_kind", storage.ErrInvalidArgument, i)
+		}
+		if f.ResourceRef == "" {
+			return fmt.Errorf("%w: drift_findings[%d].resource_ref", storage.ErrInvalidArgument, i)
+		}
+		if f.DetectedAt.IsZero() {
+			f.DetectedAt = time.Now().UTC()
+		}
+	}
+
+	const q = `
+INSERT INTO drift_findings (
+  id, scan_id, sequence, kind, severity, resource_kind, resource_ref,
+  desired, actual, diff, message, detected_at
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9::jsonb, $10::jsonb, $11, $12)
+`
+	for _, f := range findings {
+		var desired, actual any
+		if len(f.Desired) > 0 {
+			desired = []byte(f.Desired)
+		}
+		if len(f.Actual) > 0 {
+			actual = []byte(f.Actual)
+		}
+		diff := []byte(f.Diff)
+		if len(diff) == 0 {
+			diff = []byte("{}")
+		}
+		_, err := s.q.Exec(ctx, q,
+			string(f.ID),
+			string(f.ScanID),
+			f.Sequence,
+			string(f.Kind),
+			string(f.Severity),
+			f.ResourceKind,
+			f.ResourceRef,
+			desired,
+			actual,
+			diff,
+			f.Message,
+			f.DetectedAt,
+		)
+		if err != nil {
+			var pgErr *pgconn.PgError
+			if errors.As(err, &pgErr) {
+				switch pgErr.Code {
+				case pgUniqueViolation:
+					return fmt.Errorf("%w: drift_findings %s", storage.ErrAlreadyExists, pgErr.ConstraintName)
+				case pgForeignKeyViolation:
+					return fmt.Errorf("%w: %s", storage.ErrNotFound, pgErr.ConstraintName)
+				case pgCheckViolation:
+					return fmt.Errorf("%w: %s", storage.ErrInvalidArgument, pgErr.ConstraintName)
+				}
+			}
+			return fmt.Errorf("postgres: insert drift_finding: %w", err)
+		}
+	}
+	return nil
+}
+
+// GetDriftScanByID returns the scan + ordered findings, or
+// ErrDriftScanNotFound if no row matches id.
+func (s *Store) GetDriftScanByID(ctx context.Context, id domain.ID) (*domain.DriftScan, []*domain.DriftFinding, error) {
+	if id == "" {
+		return nil, nil, storage.ErrInvalidArgument
+	}
+	const scanQ = `SELECT ` + driftScanColumns + ` FROM drift_scans WHERE id = $1`
+	scan, err := scanDriftScan(s.q.QueryRow(ctx, scanQ, string(id)))
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			return nil, nil, storage.ErrDriftScanNotFound
+		}
+		return nil, nil, err
+	}
+	findings, err := s.listDriftFindings(ctx, id)
+	if err != nil {
+		return nil, nil, err
+	}
+	return scan, findings, nil
+}
+
+// ListDriftScansByProduct returns scans for productID newest first.
+// limit <= 0 means no limit.
+func (s *Store) ListDriftScansByProduct(ctx context.Context, productID domain.ID, limit int) ([]*domain.DriftScan, error) {
+	if productID == "" {
+		return nil, storage.ErrInvalidArgument
+	}
+	q := `
+SELECT ` + driftScanColumns + `
+  FROM drift_scans
+ WHERE product_id = $1
+ ORDER BY started_at DESC, id DESC
+`
+	args := []any{string(productID)}
+	if limit > 0 {
+		args = append(args, limit)
+		q += " LIMIT $2"
+	}
+	rows, err := s.q.Query(ctx, q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: list drift_scans: %w", err)
+	}
+	defer rows.Close()
+	out := make([]*domain.DriftScan, 0)
+	for rows.Next() {
+		scan, err := scanDriftScan(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, scan)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("postgres: iterate drift_scans: %w", err)
+	}
+	return out, nil
+}
+
+// GetLatestDriftScanByApprovedVersion returns the most recent scan
+// (ordered by started_at DESC) for the given approved_version_id and
+// all of its findings. Returns ErrDriftScanNotFound if no scan has run
+// against that version.
+func (s *Store) GetLatestDriftScanByApprovedVersion(ctx context.Context, approvedVersionID domain.ID) (*domain.DriftScan, []*domain.DriftFinding, error) {
+	if approvedVersionID == "" {
+		return nil, nil, storage.ErrInvalidArgument
+	}
+	const scanQ = `
+SELECT ` + driftScanColumns + `
+  FROM drift_scans
+ WHERE approved_version_id = $1
+ ORDER BY started_at DESC, id DESC
+ LIMIT 1
+`
+	scan, err := scanDriftScan(s.q.QueryRow(ctx, scanQ, string(approvedVersionID)))
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			return nil, nil, storage.ErrDriftScanNotFound
+		}
+		return nil, nil, err
+	}
+	findings, err := s.listDriftFindings(ctx, scan.ID)
+	if err != nil {
+		return nil, nil, err
+	}
+	return scan, findings, nil
+}
+
+// listDriftFindings is the shared body for the two getters that need
+// the full findings list for a scan.
+func (s *Store) listDriftFindings(ctx context.Context, scanID domain.ID) ([]*domain.DriftFinding, error) {
+	const q = `
+SELECT ` + driftFindingColumns + `
+  FROM drift_findings
+ WHERE scan_id = $1
+ ORDER BY sequence ASC
+`
+	rows, err := s.q.Query(ctx, q, string(scanID))
+	if err != nil {
+		return nil, fmt.Errorf("postgres: list drift_findings: %w", err)
+	}
+	defer rows.Close()
+	out := make([]*domain.DriftFinding, 0)
+	for rows.Next() {
+		f, err := scanDriftFinding(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, f)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("postgres: iterate drift_findings: %w", err)
+	}
+	return out, nil
+}
+
+func scanDriftScan(r scannable) (*domain.DriftScan, error) {
+	var (
+		id, productID, approvedVersionID    string
+		sequence                            int64
+		connectorName, connectorVersion     string
+		state, sourceRef                    string
+		startedAt                           time.Time
+		finishedAt                          *time.Time
+		initiatedByKind, initiatedBySubject string
+		failureMessage, summaryHash         string
+		findingCount                        int
+	)
+	err := r.Scan(
+		&id, &productID, &approvedVersionID, &sequence, &connectorName,
+		&connectorVersion, &state, &sourceRef, &startedAt, &finishedAt,
+		&initiatedByKind, &initiatedBySubject, &failureMessage,
+		&summaryHash, &findingCount,
+	)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, storage.ErrNotFound
+		}
+		return nil, fmt.Errorf("postgres: scan drift_scan: %w", err)
+	}
+	scan := &domain.DriftScan{
+		ID:                domain.ID(id),
+		ProductID:         domain.ID(productID),
+		ApprovedVersionID: domain.ID(approvedVersionID),
+		Sequence:          sequence,
+		ConnectorName:     connectorName,
+		ConnectorVersion:  connectorVersion,
+		State:             domain.DriftScanState(state),
+		SourceRef:         sourceRef,
+		StartedAt:         startedAt,
+		FinishedAt:        finishedAt,
+		InitiatedBy: domain.Actor{
+			Kind:    domain.ActorKind(initiatedByKind),
+			Subject: initiatedBySubject,
+		},
+		FailureMessage: failureMessage,
+		SummaryHash:    summaryHash,
+		FindingCount:   findingCount,
+	}
+	return scan, nil
+}
+
+func scanDriftFinding(r scannable) (*domain.DriftFinding, error) {
+	var (
+		id, scanID, kind, severity      string
+		sequence                        int
+		resourceKind, resourceRef       string
+		desiredRaw, actualRaw, diffRaw  []byte
+		message                         string
+		detectedAt                      time.Time
+	)
+	err := r.Scan(
+		&id, &scanID, &sequence, &kind, &severity, &resourceKind, &resourceRef,
+		&desiredRaw, &actualRaw, &diffRaw, &message, &detectedAt,
+	)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, storage.ErrNotFound
+		}
+		return nil, fmt.Errorf("postgres: scan drift_finding: %w", err)
+	}
+	f := &domain.DriftFinding{
+		ID:           domain.ID(id),
+		ScanID:       domain.ID(scanID),
+		Sequence:     sequence,
+		Kind:         domain.DriftKind(kind),
+		Severity:     domain.DriftSeverity(severity),
+		ResourceKind: resourceKind,
+		ResourceRef:  resourceRef,
+		Message:      message,
+		DetectedAt:   detectedAt,
+	}
+	if len(desiredRaw) > 0 {
+		f.Desired = json.RawMessage(append([]byte(nil), desiredRaw...))
+	}
+	if len(actualRaw) > 0 {
+		f.Actual = json.RawMessage(append([]byte(nil), actualRaw...))
+	}
+	if len(diffRaw) > 0 {
+		f.Diff = json.RawMessage(append([]byte(nil), diffRaw...))
+	}
+	return f, nil
+}
+
 // Compile-time assertion that *Store satisfies storage.Storage.
 var _ storage.Storage = (*Store)(nil)

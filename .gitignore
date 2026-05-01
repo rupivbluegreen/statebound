@@ -9,6 +9,12 @@
 *.out
 coverage.txt
 
+# Persistent Go module / build caches mounted into the scripts/go.sh
+# Docker container. Kept on the host to avoid re-downloading deps every
+# run; never committed.
+/.gocache/
+/.gomodcache/
+
 # Local docker-compose volumes / overrides.
 /deploy/docker-compose/.data/
 /deploy/docker-compose/docker-compose.override.yml

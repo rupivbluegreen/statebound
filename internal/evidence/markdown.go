@@ -140,6 +140,42 @@ func renderMarkdownBody(c *PackContent) (string, error) {
 		}
 	}
 
+	// Drift scans (Phase 4'). Skip the section entirely when no scans
+	// exist so older evidence packs render unchanged.
+	if len(c.DriftScans) > 0 {
+		b.WriteString("## Drift scans\n\n")
+		for _, scan := range c.DriftScans {
+			fmt.Fprintf(&b, "### %s @ %s — %s\n\n",
+				scan.ConnectorName,
+				scan.StartedAt.UTC().Format(time.RFC3339Nano),
+				scan.State,
+			)
+			fmt.Fprintf(&b, "- Source: %s\n", scan.SourceRef)
+			fmt.Fprintf(&b, "- Findings: %d (%s)\n",
+				scan.FindingCount,
+				renderDriftSeverityCounts(scan.Findings),
+			)
+			if scan.SummaryHash != "" {
+				fmt.Fprintf(&b, "- Summary hash: %s\n", scan.SummaryHash)
+			}
+			b.WriteString("\n")
+			if len(scan.Findings) > 0 {
+				b.WriteString("| # | Kind | Severity | Resource | Message |\n")
+				b.WriteString("|---|------|----------|----------|---------|\n")
+				for _, f := range scan.Findings {
+					fmt.Fprintf(&b, "| %d | %s | %s | %s | %s |\n",
+						f.Sequence,
+						f.Kind,
+						f.Severity,
+						escapeCell(f.ResourceKind+" "+f.ResourceRef),
+						escapeCell(f.Message),
+					)
+				}
+				b.WriteString("\n")
+			}
+		}
+	}
+
 	// Audit events
 	b.WriteString("## Audit events\n\n")
 	if len(c.AuditEvents) == 0 {
@@ -314,6 +350,32 @@ func escapeCell(s string) string {
 	s = strings.ReplaceAll(s, "\r\n", " ")
 	s = strings.ReplaceAll(s, "\n", " ")
 	return s
+}
+
+// renderDriftSeverityCounts produces a stable human-readable summary line
+// for a drift scan's findings, e.g. "1 critical, 0 high, 2 medium, 0 low,
+// 0 info". Severity order is fixed (Critical -> Info) so two renders read
+// identically.
+func renderDriftSeverityCounts(findings []DriftFindingRef) string {
+	counts := map[string]int{
+		"critical": 0,
+		"high":     0,
+		"medium":   0,
+		"low":      0,
+		"info":     0,
+	}
+	for _, f := range findings {
+		if _, ok := counts[f.Severity]; !ok {
+			counts[f.Severity] = 0
+		}
+		counts[f.Severity]++
+	}
+	order := []string{"critical", "high", "medium", "low", "info"}
+	parts := make([]string, 0, len(order))
+	for _, sev := range order {
+		parts = append(parts, fmt.Sprintf("%d %s", counts[sev], sev))
+	}
+	return strings.Join(parts, ", ")
 }
 
 // shortHash returns the first 12 hex characters of h, or "—" if h is empty.

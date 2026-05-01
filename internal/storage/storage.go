@@ -25,6 +25,8 @@ var (
 	ErrEvidencePackNotFound = errors.New("storage: evidence pack not found")
 	// ErrPlanNotFound is returned when a plans lookup misses.
 	ErrPlanNotFound = errors.New("storage: plan not found")
+	// ErrDriftScanNotFound is returned when a drift_scans lookup misses.
+	ErrDriftScanNotFound = errors.New("storage: drift scan not found")
 )
 
 // AuditFilter narrows ListAuditEvents results. A zero Limit means no limit.
@@ -244,6 +246,41 @@ type PlanStore interface {
 	UpdatePlanState(ctx context.Context, id domain.ID, state domain.PlanState, reason string) error
 }
 
+// DriftStore persists connector-driven drift scans and their findings.
+//
+// A drift scan begins in 'running' state via AppendDriftScan, lands in
+// a terminal state ('succeeded' | 'failed') via UpdateDriftScan, and
+// the accompanying findings are bulk-inserted via AppendDriftFindings.
+// Findings are append-only; there is no per-finding update or delete
+// API (delete-cascade via the FK is the only path).
+type DriftStore interface {
+	// AppendDriftScan inserts a freshly-created drift_scans row in
+	// 'running' state. FK violations on product_id / approved_version_id
+	// surface as ErrNotFound.
+	AppendDriftScan(ctx context.Context, scan *domain.DriftScan) error
+	// UpdateDriftScan persists the terminal state (state, finished_at,
+	// failure_message, summary_hash, finding_count) on an existing scan
+	// id. Returns ErrDriftScanNotFound if no row matches.
+	UpdateDriftScan(ctx context.Context, scan *domain.DriftScan) error
+	// AppendDriftFindings bulk-inserts findings against an existing
+	// scan. UNIQUE(scan_id, sequence) violations surface as
+	// ErrAlreadyExists (caller bug). FK violations on the scan id
+	// surface as ErrNotFound.
+	AppendDriftFindings(ctx context.Context, findings []*domain.DriftFinding) error
+	// GetDriftScanByID returns the scan + ordered findings, or
+	// ErrDriftScanNotFound if no row matches id. Findings are returned
+	// in sequence-ascending order.
+	GetDriftScanByID(ctx context.Context, id domain.ID) (*domain.DriftScan, []*domain.DriftFinding, error)
+	// ListDriftScansByProduct returns scans for productID newest first
+	// (ordered by started_at DESC). limit <= 0 means no limit. An
+	// empty slice is returned (not an error) when there are no rows.
+	ListDriftScansByProduct(ctx context.Context, productID domain.ID, limit int) ([]*domain.DriftScan, error)
+	// GetLatestDriftScanByApprovedVersion returns the most recent scan
+	// for the given approved_version_id and all its findings, or
+	// ErrDriftScanNotFound if no scan has run against that version.
+	GetLatestDriftScanByApprovedVersion(ctx context.Context, approvedVersionID domain.ID) (*domain.DriftScan, []*domain.DriftFinding, error)
+}
+
 // Storage is the aggregate persistence boundary used by the application layer.
 type Storage interface {
 	ProductStore
@@ -260,6 +297,7 @@ type Storage interface {
 	PolicyDecisionStore
 	EvidencePackStore
 	PlanStore
+	DriftStore
 	Close(ctx context.Context) error
 	Ping(ctx context.Context) error
 	// WithTx runs fn inside a database transaction. The Storage handed to fn issues

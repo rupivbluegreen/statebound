@@ -25,19 +25,23 @@ type fakeStore struct {
 	approvalsByCS    map[domain.ID][]*domain.Approval
 	decisionsByCS    map[domain.ID][]*storage.PolicyDecisionRecord
 	auditByResource  map[string][]*domain.AuditEvent // key = resourceType + "|" + resourceID
+	driftScansByProd map[domain.ID][]*domain.DriftScan
+	driftFindings    map[domain.ID][]*domain.DriftFinding // key = scanID
 }
 
 func newFakeStore() *fakeStore {
 	return &fakeStore{
-		products:        map[domain.ID]*domain.Product{},
-		versions:        map[domain.ID]*domain.ApprovedVersion{},
-		snapshots:       map[domain.ID]*domain.ApprovedVersionSnapshot{},
-		versionsByProd:  map[domain.ID][]*domain.ApprovedVersion{},
-		changeSets:      map[domain.ID]*domain.ChangeSet{},
-		itemsByCS:       map[domain.ID][]*domain.ChangeSetItem{},
-		approvalsByCS:   map[domain.ID][]*domain.Approval{},
-		decisionsByCS:   map[domain.ID][]*storage.PolicyDecisionRecord{},
-		auditByResource: map[string][]*domain.AuditEvent{},
+		products:         map[domain.ID]*domain.Product{},
+		versions:         map[domain.ID]*domain.ApprovedVersion{},
+		snapshots:        map[domain.ID]*domain.ApprovedVersionSnapshot{},
+		versionsByProd:   map[domain.ID][]*domain.ApprovedVersion{},
+		changeSets:       map[domain.ID]*domain.ChangeSet{},
+		itemsByCS:        map[domain.ID][]*domain.ChangeSetItem{},
+		approvalsByCS:    map[domain.ID][]*domain.Approval{},
+		decisionsByCS:    map[domain.ID][]*storage.PolicyDecisionRecord{},
+		auditByResource:  map[string][]*domain.AuditEvent{},
+		driftScansByProd: map[domain.ID][]*domain.DriftScan{},
+		driftFindings:    map[domain.ID][]*domain.DriftFinding{},
 	}
 }
 
@@ -113,6 +117,23 @@ func (s *fakeStore) ListAuditEvents(_ context.Context, f storage.AuditFilter) ([
 	out := make([]*domain.AuditEvent, 0, len(s.auditByResource[key]))
 	out = append(out, s.auditByResource[key]...)
 	return out, nil
+}
+
+func (s *fakeStore) ListDriftScansByProduct(_ context.Context, productID domain.ID, _ int) ([]*domain.DriftScan, error) {
+	out := make([]*domain.DriftScan, 0, len(s.driftScansByProd[productID]))
+	out = append(out, s.driftScansByProd[productID]...)
+	return out, nil
+}
+
+func (s *fakeStore) GetDriftScanByID(_ context.Context, id domain.ID) (*domain.DriftScan, []*domain.DriftFinding, error) {
+	for _, scans := range s.driftScansByProd {
+		for _, scan := range scans {
+			if scan.ID == id {
+				return scan, s.driftFindings[id], nil
+			}
+		}
+	}
+	return nil, nil, storage.ErrDriftScanNotFound
 }
 
 // fixedFixture builds a deterministic fakeStore plus the ids needed to
@@ -440,5 +461,164 @@ func TestBuilder_PolicyDecisionRulesCanonicalised(t *testing.T) {
 	want := `[{"message":"prod entitlement detected","name":"production_requires_approval","outcome":"escalation_required"}]`
 	if string(pack.PolicyDecisions[0].Rules) != want {
 		t.Errorf("rules canonical form:\n got %s\nwant %s", pack.PolicyDecisions[0].Rules, want)
+	}
+}
+
+// TestBuilder_DriftScansEmptyByDefault asserts that a fixture with no
+// drift scans yields an empty (not nil) DriftScans slice. The wire shape
+// promise depends on this — downstream tooling expects the field to be
+// present.
+func TestBuilder_DriftScansEmptyByDefault(t *testing.T) {
+	store, productID, _, _ := fixedFixture(t)
+	b := NewBuilder(store).WithClock(fixedClock())
+	pack, err := b.BuildLatest(context.Background(), productID)
+	if err != nil {
+		t.Fatalf("BuildLatest: %v", err)
+	}
+	if got, want := len(pack.DriftScans), 0; got != want {
+		t.Errorf("len(DriftScans) = %d, want %d", got, want)
+	}
+	if pack.DriftScans == nil {
+		t.Errorf("DriftScans should be a non-nil empty slice; got nil")
+	}
+}
+
+// TestBuilder_DriftScansPopulated stages a drift scan against the fixture's
+// approved version, builds the pack, and asserts the scan + findings
+// appear in the canonical bytes with sorted finding sequences and
+// canonicalised diff bodies.
+func TestBuilder_DriftScansPopulated(t *testing.T) {
+	store, productID, avID, _ := fixedFixture(t)
+
+	scanID := domain.ID("00000000-0000-0000-0000-00000000e001")
+	finishedAt := time.Date(2026, 5, 1, 12, 5, 0, 0, time.UTC)
+	startedAt := time.Date(2026, 5, 1, 12, 4, 0, 0, time.UTC)
+	scan := &domain.DriftScan{
+		ID:                scanID,
+		ProductID:         productID,
+		ApprovedVersionID: avID,
+		Sequence:          1,
+		ConnectorName:     "linux-sudo",
+		ConnectorVersion:  "0.4.0",
+		State:             domain.DriftScanStateSucceeded,
+		SourceRef:         "file:///etc/sudoers.d",
+		StartedAt:         startedAt,
+		FinishedAt:        &finishedAt,
+		InitiatedBy:       domain.Actor{Kind: domain.ActorHuman, Subject: "alice@example.com"},
+		SummaryHash:       "sha256:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+		FindingCount:      1,
+	}
+	store.driftScansByProd[productID] = []*domain.DriftScan{scan}
+
+	finding := &domain.DriftFinding{
+		ID:           "00000000-0000-0000-0000-00000000f001",
+		ScanID:       scanID,
+		Sequence:     1,
+		Kind:         domain.DriftKindUnexpected,
+		Severity:     domain.DriftSeverityHigh,
+		ResourceKind: "linux.sudoers-fragment",
+		ResourceRef:  "/etc/sudoers.d/rogue-elevated",
+		Actual:       json.RawMessage(`{"path":"/etc/sudoers.d/rogue-elevated","content":"%rogue-elevated ALL=(root) ALL"}`),
+		// Out-of-order keys so we can verify canonicalisation.
+		Diff:       json.RawMessage(`{"reason":"unexpected fragment","missing":false}`),
+		Message:    "fragment present in actual but not desired",
+		DetectedAt: finishedAt,
+	}
+	store.driftFindings[scanID] = []*domain.DriftFinding{finding}
+
+	b := NewBuilder(store).WithClock(fixedClock())
+	pack, err := b.BuildLatest(context.Background(), productID)
+	if err != nil {
+		t.Fatalf("BuildLatest: %v", err)
+	}
+	if got, want := len(pack.DriftScans), 1; got != want {
+		t.Fatalf("len(DriftScans) = %d, want %d", got, want)
+	}
+	gotScan := pack.DriftScans[0]
+	if gotScan.ID != scanID {
+		t.Errorf("Scan.ID = %s, want %s", gotScan.ID, scanID)
+	}
+	if got, want := gotScan.SummaryHash, scan.SummaryHash; got != want {
+		t.Errorf("Scan.SummaryHash = %q, want %q", got, want)
+	}
+	if got, want := len(gotScan.Findings), 1; got != want {
+		t.Fatalf("len(Findings) = %d, want %d", got, want)
+	}
+	gotFinding := gotScan.Findings[0]
+	if gotFinding.Kind != "unexpected" {
+		t.Errorf("Finding.Kind = %q, want %q", gotFinding.Kind, "unexpected")
+	}
+	// Diff should be canonicalised: keys sorted alphabetically.
+	wantDiff := `{"missing":false,"reason":"unexpected fragment"}`
+	if string(gotFinding.Diff) != wantDiff {
+		t.Errorf("Finding.Diff = %s, want %s", gotFinding.Diff, wantDiff)
+	}
+	if gotFinding.Desired != nil {
+		t.Errorf("Finding.Desired should be nil for unexpected kind; got %s", gotFinding.Desired)
+	}
+
+	// Two encodes of the same pack must be byte-identical.
+	first, err := EncodeJSON(pack)
+	if err != nil {
+		t.Fatalf("EncodeJSON #1: %v", err)
+	}
+	pack2, err := b.BuildLatest(context.Background(), productID)
+	if err != nil {
+		t.Fatalf("BuildLatest #2: %v", err)
+	}
+	second, err := EncodeJSON(pack2)
+	if err != nil {
+		t.Fatalf("EncodeJSON #2: %v", err)
+	}
+	if !bytes.Equal(first, second) {
+		t.Fatalf("pack with drift scans not byte-identical across builds:\nfirst=%s\nsecond=%s", first, second)
+	}
+}
+
+// TestBuilder_DriftScansFilteredByApprovedVersion asserts the builder
+// drops scans recorded against a different approved version. The
+// pack-shape contract is "scans for this version", not "all scans for the
+// product".
+func TestBuilder_DriftScansFilteredByApprovedVersion(t *testing.T) {
+	store, productID, avID, _ := fixedFixture(t)
+
+	otherAVID := domain.ID("00000000-0000-0000-0000-00000000ffff")
+	mineID := domain.ID("00000000-0000-0000-0000-00000000e001")
+	otherID := domain.ID("00000000-0000-0000-0000-00000000e002")
+	startedAt := time.Date(2026, 5, 1, 12, 4, 0, 0, time.UTC)
+	finishedAt := startedAt.Add(time.Minute)
+
+	mkScan := func(id, av domain.ID) *domain.DriftScan {
+		return &domain.DriftScan{
+			ID:                id,
+			ProductID:         productID,
+			ApprovedVersionID: av,
+			Sequence:          1,
+			ConnectorName:     "linux-sudo",
+			ConnectorVersion:  "0.4.0",
+			State:             domain.DriftScanStateSucceeded,
+			SourceRef:         "file:///etc/sudoers.d",
+			StartedAt:         startedAt,
+			FinishedAt:        &finishedAt,
+			InitiatedBy:       domain.Actor{Kind: domain.ActorHuman, Subject: "alice@example.com"},
+			SummaryHash:       "sha256:" + string(id),
+			FindingCount:      0,
+		}
+	}
+	store.driftScansByProd[productID] = []*domain.DriftScan{
+		mkScan(mineID, avID),
+		mkScan(otherID, otherAVID),
+	}
+
+	b := NewBuilder(store).WithClock(fixedClock())
+	pack, err := b.BuildLatest(context.Background(), productID)
+	if err != nil {
+		t.Fatalf("BuildLatest: %v", err)
+	}
+	if got, want := len(pack.DriftScans), 1; got != want {
+		t.Fatalf("len(DriftScans) = %d, want %d (scan from another AV should be dropped)", got, want)
+	}
+	if pack.DriftScans[0].ID != mineID {
+		t.Errorf("DriftScans[0].ID = %s, want %s", pack.DriftScans[0].ID, mineID)
 	}
 }

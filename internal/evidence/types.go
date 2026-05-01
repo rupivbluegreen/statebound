@@ -42,6 +42,15 @@ type PackContent struct {
 	Items           []ChangeSetItemRef  `json:"items"`
 	AuditEvents     []AuditEventRef     `json:"audit_events"`
 	PolicyDecisions []PolicyDecisionRef `json:"policy_decisions"`
+	// DriftScans collects every drift scan recorded against this approved
+	// version, with each scan's findings inlined. Phase 4' adds this slice;
+	// the field is always emitted (an empty slice when no scans exist) so
+	// the wire shape is stable for downstream tooling. The schema_version
+	// stays "evidence.statebound.dev/v1alpha1" because every Phase 4'
+	// pack always carries the field — older packs that predate the field
+	// still hash differently, but that is a one-time forward jump aligned
+	// with the v0.5 release.
+	DriftScans []DriftScanRef `json:"drift_scans"`
 }
 
 // ProductRef is the Product subset preserved in an evidence pack.
@@ -146,4 +155,39 @@ type PolicyDecisionRef struct {
 	BundleHash  string          `json:"bundle_hash"`
 	Rules       json.RawMessage `json:"rules"`
 	EvaluatedAt time.Time       `json:"evaluated_at"`
+}
+
+// DriftScanRef preserves one connector-driven drift scan against the pack's
+// approved version, with every finding inlined. The builder collects scans
+// via storage.ListDriftScansByProduct filtered to the approved version's
+// id; scans are sorted by StartedAt asc so two builds emit byte-identical
+// bytes regardless of the storage layer's default ordering.
+type DriftScanRef struct {
+	ID               domain.ID         `json:"id"`
+	ConnectorName    string            `json:"connector_name"`
+	ConnectorVersion string            `json:"connector_version"`
+	SourceRef        string            `json:"source_ref"`
+	State            string            `json:"state"`
+	StartedAt        time.Time         `json:"started_at"`
+	FinishedAt       *time.Time        `json:"finished_at,omitempty"`
+	SummaryHash      string            `json:"summary_hash"`
+	FindingCount     int               `json:"finding_count"`
+	Findings         []DriftFindingRef `json:"findings"`
+}
+
+// DriftFindingRef preserves one mismatch reported by a DriftScan. Bodies
+// (Desired/Actual/Diff) are pre-canonicalised by the builder so two builds
+// of the same scan emit byte-identical bytes. Desired is omitted for
+// "unexpected" findings; Actual is omitted for "missing" findings.
+type DriftFindingRef struct {
+	Sequence     int             `json:"sequence"`
+	Kind         string          `json:"kind"`
+	Severity     string          `json:"severity"`
+	ResourceKind string          `json:"resource_kind"`
+	ResourceRef  string          `json:"resource_ref"`
+	Desired      json.RawMessage `json:"desired,omitempty"`
+	Actual       json.RawMessage `json:"actual,omitempty"`
+	Diff         json.RawMessage `json:"diff"`
+	Message      string          `json:"message"`
+	DetectedAt   time.Time       `json:"detected_at"`
 }

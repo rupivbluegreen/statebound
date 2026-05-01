@@ -32,6 +32,13 @@ type BuilderStore interface {
 	ListApprovalsByChangeSet(ctx context.Context, csID domain.ID) ([]*domain.Approval, error)
 	ListPolicyDecisionsByChangeSet(ctx context.Context, csID domain.ID) ([]*storage.PolicyDecisionRecord, error)
 	ListAuditEvents(ctx context.Context, f storage.AuditFilter) ([]*domain.AuditEvent, error)
+	// ListDriftScansByProduct returns every drift scan recorded against
+	// productID newest first. The builder filters to the pack's approved
+	// version and drops any scan that does not match.
+	ListDriftScansByProduct(ctx context.Context, productID domain.ID, limit int) ([]*domain.DriftScan, error)
+	// GetDriftScanByID is used to load each filtered scan's findings; the
+	// list call returns scan metadata only.
+	GetDriftScanByID(ctx context.Context, id domain.ID) (*domain.DriftScan, []*domain.DriftFinding, error)
 }
 
 // Builder assembles a PackContent from the data layer. It is read-only
@@ -224,7 +231,133 @@ func (b *Builder) buildFor(
 		return nil, err
 	}
 
+	// 8. Drift scans (Phase 4'). We list every scan against the product
+	//    via ListDriftScansByProduct (limit 0 = no limit) and filter to
+	//    those whose ApprovedVersionID matches the pack's. Each scan
+	//    matches we re-load via GetDriftScanByID to fetch the findings,
+	//    then sort the result deterministically by StartedAt asc.
+	pack.DriftScans, err = b.collectDriftScans(ctx, av)
+	if err != nil {
+		return nil, fmt.Errorf("evidence: collect drift scans: %w", err)
+	}
+
 	return pack, nil
+}
+
+// collectDriftScans loads every scan against av's product, filters to the
+// pack's approved version id, then re-loads each match to fetch findings.
+// The result is ordered by StartedAt asc so two builds emit byte-identical
+// bytes regardless of the storage layer's ordering choices.
+//
+// We intentionally drop scans that match a different ApprovedVersionID
+// (the same product can have many approved versions, each with their own
+// scans). Always emitting an empty slice rather than nil keeps the wire
+// shape stable for downstream tooling.
+func (b *Builder) collectDriftScans(ctx context.Context, av *domain.ApprovedVersion) ([]DriftScanRef, error) {
+	scans, err := b.store.ListDriftScansByProduct(ctx, av.ProductID, 0)
+	if err != nil {
+		return nil, fmt.Errorf("list drift scans: %w", err)
+	}
+	matched := make([]*domain.DriftScan, 0, len(scans))
+	for _, s := range scans {
+		if s == nil {
+			continue
+		}
+		if s.ApprovedVersionID != av.ID {
+			continue
+		}
+		matched = append(matched, s)
+	}
+	out := make([]DriftScanRef, 0, len(matched))
+	for _, scan := range matched {
+		_, findings, err := b.store.GetDriftScanByID(ctx, scan.ID)
+		if err != nil {
+			return nil, fmt.Errorf("load drift scan %s: %w", scan.ID, err)
+		}
+		ref, err := driftScanRef(scan, findings)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, ref)
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		ai, aj := out[i].StartedAt, out[j].StartedAt
+		if !ai.Equal(aj) {
+			return ai.Before(aj)
+		}
+		return out[i].ID < out[j].ID
+	})
+	return out, nil
+}
+
+// driftScanRef projects a domain.DriftScan + its findings into the
+// pack-facing DriftScanRef. Finding bodies are canonicalised so the bytes
+// are stable regardless of how Postgres serialised the JSONB rows.
+func driftScanRef(scan *domain.DriftScan, findings []*domain.DriftFinding) (DriftScanRef, error) {
+	ref := DriftScanRef{
+		ID:               scan.ID,
+		ConnectorName:    scan.ConnectorName,
+		ConnectorVersion: scan.ConnectorVersion,
+		SourceRef:        scan.SourceRef,
+		State:            string(scan.State),
+		StartedAt:        scan.StartedAt.UTC(),
+		SummaryHash:      scan.SummaryHash,
+		FindingCount:     scan.FindingCount,
+	}
+	if scan.FinishedAt != nil {
+		t := scan.FinishedAt.UTC()
+		ref.FinishedAt = &t
+	}
+	out := make([]DriftFindingRef, 0, len(findings))
+	for _, f := range findings {
+		if f == nil {
+			continue
+		}
+		desired, err := canonicaliseRawMessage(f.Desired)
+		if err != nil {
+			return DriftScanRef{}, fmt.Errorf("canonicalize finding %s desired: %w", f.ID, err)
+		}
+		actual, err := canonicaliseRawMessage(f.Actual)
+		if err != nil {
+			return DriftScanRef{}, fmt.Errorf("canonicalize finding %s actual: %w", f.ID, err)
+		}
+		diff, err := canonicaliseRawMessage(f.Diff)
+		if err != nil {
+			return DriftScanRef{}, fmt.Errorf("canonicalize finding %s diff: %w", f.ID, err)
+		}
+		// Diff is NOT NULL in the storage layer; default empty {} for the
+		// pack so the field is always present.
+		if len(diff) == 0 {
+			diff = json.RawMessage("{}")
+		}
+		out = append(out, DriftFindingRef{
+			Sequence:     f.Sequence,
+			Kind:         string(f.Kind),
+			Severity:     string(f.Severity),
+			ResourceKind: f.ResourceKind,
+			ResourceRef:  f.ResourceRef,
+			Desired:      desired,
+			Actual:       actual,
+			Diff:         diff,
+			Message:      f.Message,
+			DetectedAt:   f.DetectedAt.UTC(),
+		})
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		return out[i].Sequence < out[j].Sequence
+	})
+	ref.Findings = out
+	return ref, nil
+}
+
+// canonicaliseRawMessage runs a JSONB blob through the local Canonicalize
+// emitter so map keys are sorted at every level. Empty/nil input returns
+// nil so omitempty fields elide cleanly at marshal time.
+func canonicaliseRawMessage(raw json.RawMessage) (json.RawMessage, error) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	return Canonicalize(raw)
 }
 
 // collectAuditEvents fetches every audit event keyed off the change set,

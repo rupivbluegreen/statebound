@@ -25,7 +25,11 @@ const (
 	schemaVersion    = "linux-sudo.statebound.dev/v0alpha1"
 )
 
-// Connector is the linux-sudo plan-only connector.
+// Connector is the linux-sudo plan + drift connector. Phase 4 shipped
+// the Plan path; Phase 4' added CollectActualState (read sudoers
+// fragments off disk) and Compare (diff observed bytes against the
+// approved-state plan). All operations are pure file IO — the
+// connector never executes sudo, ssh, or any shell command.
 type Connector struct{}
 
 // New returns a fresh Connector. Stateless; safe to share.
@@ -37,9 +41,14 @@ func (*Connector) Name() string { return connectorName }
 // Version returns the connector semver.
 func (*Connector) Version() string { return connectorVersion }
 
-// Capabilities reports that this connector only supports Plan in Phase 4.
+// Capabilities reports Plan, CollectActualState, and Compare. Phase 4'
+// adds drift detection on top of the Phase 4 plan path.
 func (*Connector) Capabilities() []connectors.Capability {
-	return []connectors.Capability{connectors.CapabilityPlan}
+	return []connectors.Capability{
+		connectors.CapabilityPlan,
+		connectors.CapabilityCollectActual,
+		connectors.CapabilityCompare,
+	}
 }
 
 // ValidateDesiredState performs soft pre-flight checks against the

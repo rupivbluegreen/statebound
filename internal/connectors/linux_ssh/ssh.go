@@ -23,7 +23,14 @@ const (
 )
 
 // Connector is the linux-ssh plan-only connector.
-type Connector struct{}
+//
+// UnsupportedCollectAndCompare is embedded so the type satisfies the
+// Phase 4'+ Connector interface (which gained CollectActualState and
+// Compare) without yet implementing drift detection. Both methods
+// return ErrCapabilityNotSupported.
+type Connector struct {
+	connectors.UnsupportedCollectAndCompare
+}
 
 // New returns a fresh Connector. Stateless; safe to share.
 func New() *Connector { return &Connector{} }

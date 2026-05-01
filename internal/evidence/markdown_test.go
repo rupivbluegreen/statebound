@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestExportMarkdown_Deterministic(t *testing.T) {
@@ -105,6 +106,83 @@ func TestExportMarkdown_PipeEscapeInTableCell(t *testing.T) {
 	}
 	if !strings.Contains(env.Body, `pay\|ments\|prod`) {
 		t.Errorf("pipe characters not escaped in table cell; body:\n%s", env.Body)
+	}
+}
+
+// TestExportMarkdown_DriftScansSectionOmittedWhenEmpty asserts the Drift
+// scans section is skipped entirely when the pack has no scans, so older
+// (pre-Phase 4') evidence packs render unchanged.
+func TestExportMarkdown_DriftScansSectionOmittedWhenEmpty(t *testing.T) {
+	pack := fixedPack(t)
+	out, err := ExportMarkdown(pack)
+	if err != nil {
+		t.Fatalf("ExportMarkdown: %v", err)
+	}
+	var env struct {
+		Body string `json:"body"`
+	}
+	if err := json.Unmarshal(out, &env); err != nil {
+		t.Fatalf("decode envelope: %v", err)
+	}
+	if strings.Contains(env.Body, "## Drift scans") {
+		t.Errorf("Drift scans section should be omitted when empty; body:\n%s", env.Body)
+	}
+}
+
+// TestExportMarkdown_DriftScansSectionWhenPopulated stages a scan + a
+// finding into the pack and asserts the rendered Markdown contains the
+// header, the source line, and the findings table row.
+func TestExportMarkdown_DriftScansSectionWhenPopulated(t *testing.T) {
+	pack := fixedPack(t)
+	finishedAt := pack.GeneratedAt.Add(time.Minute)
+	pack.DriftScans = []DriftScanRef{
+		{
+			ID:               "00000000-0000-0000-0000-00000000e001",
+			ConnectorName:    "linux-sudo",
+			ConnectorVersion: "0.4.0",
+			SourceRef:        "file:///etc/sudoers.d",
+			State:            "succeeded",
+			StartedAt:        pack.GeneratedAt,
+			FinishedAt:       &finishedAt,
+			SummaryHash:      "sha256:abcdef",
+			FindingCount:     1,
+			Findings: []DriftFindingRef{
+				{
+					Sequence:     1,
+					Kind:         "unexpected",
+					Severity:     "high",
+					ResourceKind: "linux.sudoers-fragment",
+					ResourceRef:  "/etc/sudoers.d/rogue-elevated",
+					Diff:         []byte(`{"reason":"unexpected fragment"}`),
+					Message:      "fragment present in actual but not desired",
+					DetectedAt:   finishedAt,
+				},
+			},
+		},
+	}
+	out, err := ExportMarkdown(pack)
+	if err != nil {
+		t.Fatalf("ExportMarkdown: %v", err)
+	}
+	var env struct {
+		Body string `json:"body"`
+	}
+	if err := json.Unmarshal(out, &env); err != nil {
+		t.Fatalf("decode envelope: %v", err)
+	}
+	body := env.Body
+	for _, want := range []string{
+		"## Drift scans",
+		"### linux-sudo @",
+		"- Source: file:///etc/sudoers.d",
+		"- Findings: 1 (0 critical, 1 high, 0 medium, 0 low, 0 info)",
+		"unexpected",
+		"rogue-elevated",
+		"fragment present in actual but not desired",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("Drift scans section missing %q; body:\n%s", want, body)
+		}
 	}
 }
 

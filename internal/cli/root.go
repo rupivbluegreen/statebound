@@ -79,6 +79,7 @@ func init() {
 	addPolicyCmd(rootCmd)
 	addEvidenceCmd(rootCmd)
 	addPlanCmd(rootCmd)
+	addDriftCmd(rootCmd)
 	addConnectorCmd(rootCmd)
 	addAgentCmd(rootCmd)
 	addInferenceCmd(rootCmd)

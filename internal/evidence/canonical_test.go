@@ -142,6 +142,10 @@ func fixedPack(t *testing.T) *PackContent {
 				EvaluatedAt: ts,
 			},
 		},
+		// Phase 4' adds DriftScans; an empty slice keeps the wire shape
+		// stable for downstream tooling that expects the field to always
+		// be present.
+		DriftScans: []DriftScanRef{},
 	}
 	return pack
 }
