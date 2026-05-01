@@ -117,5 +117,16 @@ jobs:
           ./bin/statebound evidence export --product payments-api --format markdown --output /tmp/ev1.md
           test -s /tmp/ev1.md
 
+          # Phase 4: plan-only connectors
+          ./bin/statebound connector list
+          ./bin/statebound plan --product payments-api --connector linux-sudo --output /tmp/plan-sudo-1.json
+          ./bin/statebound plan --product payments-api --connector linux-sudo --output /tmp/plan-sudo-2.json
+          # Same approved version + same connector version -> byte-identical content
+          diff -q /tmp/plan-sudo-1.json /tmp/plan-sudo-2.json
+          ./bin/statebound plan --product payments-api --connector linux-ssh --output /tmp/plan-ssh.json
+          test -s /tmp/plan-ssh.json
+          grep -q "linux.sudoers-fragment" /tmp/plan-sudo-1.json
+          ./bin/statebound audit verify
+
           # Standalone product create still works
           ./bin/statebound product create checkout-api --owner ci-bot --description "CI smoke product"

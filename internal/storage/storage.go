@@ -23,6 +23,8 @@ var (
 	ErrPolicyDecisionNotFound = errors.New("storage: policy decision not found")
 	// ErrEvidencePackNotFound is returned when an evidence_packs lookup misses.
 	ErrEvidencePackNotFound = errors.New("storage: evidence pack not found")
+	// ErrPlanNotFound is returned when a plans lookup misses.
+	ErrPlanNotFound = errors.New("storage: plan not found")
 )
 
 // AuditFilter narrows ListAuditEvents results. A zero Limit means no limit.
@@ -205,6 +207,43 @@ type EvidencePackStore interface {
 	GetEvidencePackByVersionFormat(ctx context.Context, approvedVersionID domain.ID, format string) (*domain.EvidencePack, error)
 }
 
+// PlanStore persists connector-generated Plans and their PlanItems.
+//
+// Plans are deterministic: re-running plan with identical
+// (approved_version, connector, content) inputs produces an identical
+// content_hash. AppendPlan exploits that: ON CONFLICT
+// (approved_version_id, connector_name, content_hash) DO NOTHING means
+// a re-plan returns nil and leaves the existing row + items in place.
+//
+// UpdatePlanState performs the column update only — it does not check
+// the state-machine. Callers (CLI/service layer) pre-validate the
+// transition via domain.Plan.CanTransitionTo.
+type PlanStore interface {
+	// AppendPlan inserts plan + items in one transaction. ON CONFLICT
+	// (approved_version_id, connector_name, content_hash) DO NOTHING:
+	// a re-plan with byte-identical content is a no-op, no items are
+	// inserted, and the method returns nil. FK violations on product
+	// or approved_version surface as ErrNotFound.
+	AppendPlan(ctx context.Context, plan *domain.Plan, items []*domain.PlanItem) error
+	// GetPlanByID returns the plan + ordered items, or ErrPlanNotFound
+	// if no row matches id. Items are returned in sequence-ascending
+	// order.
+	GetPlanByID(ctx context.Context, id domain.ID) (*domain.Plan, []*domain.PlanItem, error)
+	// ListPlansByProduct returns plans for productID newest first.
+	// limit <= 0 means no limit. An empty slice is returned (not an
+	// error) when the product has no plans.
+	ListPlansByProduct(ctx context.Context, productID domain.ID, limit int) ([]*domain.Plan, error)
+	// ListPlansByApprovedVersion returns every plan against the given
+	// approved version, newest first. Useful for "what connectors have
+	// planned against av-N".
+	ListPlansByApprovedVersion(ctx context.Context, approvedVersionID domain.ID) ([]*domain.Plan, error)
+	// UpdatePlanState moves a plan to newState. The caller pre-validates
+	// the transition; this method only updates the columns. A non-empty
+	// reason populates refused_reason; when newState is not Refused the
+	// reason is ignored. Returns ErrPlanNotFound if no row matches id.
+	UpdatePlanState(ctx context.Context, id domain.ID, state domain.PlanState, reason string) error
+}
+
 // Storage is the aggregate persistence boundary used by the application layer.
 type Storage interface {
 	ProductStore
@@ -220,6 +259,7 @@ type Storage interface {
 	ApprovedVersionStore
 	PolicyDecisionStore
 	EvidencePackStore
+	PlanStore
 	Close(ctx context.Context) error
 	Ping(ctx context.Context) error
 	// WithTx runs fn inside a database transaction. The Storage handed to fn issues

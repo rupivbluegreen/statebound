@@ -2301,5 +2301,437 @@ func joinAnd(parts []string) string {
 	return out
 }
 
+// -------- Plans --------
+
+const planColumns = "id, product_id, approved_version_id, sequence, connector_name, " +
+	"connector_version, state, summary, content_hash, content, refused_reason, " +
+	"generated_at, generated_by_kind, generated_by_subject"
+
+const planItemColumns = "id, plan_id, sequence, action, resource_kind, " +
+	"resource_ref, body, risk, note"
+
+// validPlanStates mirrors the CHECK constraint in
+// migrations/0006_plans.sql. Validating in Go gives callers a clean
+// ErrInvalidArgument up front instead of a Postgres CHECK violation.
+var validPlanStates = map[string]struct{}{
+	"draft":    {},
+	"ready":    {},
+	"refused":  {},
+	"applied":  {},
+	"failed":   {},
+}
+
+var validPlanActions = map[string]struct{}{
+	"create": {},
+	"update": {},
+	"delete": {},
+}
+
+var validPlanRisks = map[string]struct{}{
+	"low":      {},
+	"medium":   {},
+	"high":     {},
+	"critical": {},
+}
+
+// AppendPlan inserts a plan + its items in one transaction. INSERT ...
+// ON CONFLICT (approved_version_id, connector_name, content_hash) DO
+// NOTHING makes deterministic re-plans a no-op: when the unique
+// constraint trips, this method returns nil and does not insert items
+// either. FK violations on product_id / approved_version_id surface as
+// ErrNotFound so callers can distinguish a stale reference from a
+// transient failure.
+func (s *Store) AppendPlan(ctx context.Context, plan *domain.Plan, items []*domain.PlanItem) error {
+	if plan == nil {
+		return storage.ErrInvalidArgument
+	}
+	if plan.ID == "" {
+		return fmt.Errorf("%w: plan id", storage.ErrInvalidArgument)
+	}
+	if plan.ProductID == "" {
+		return fmt.Errorf("%w: plan product id", storage.ErrInvalidArgument)
+	}
+	if plan.ApprovedVersionID == "" {
+		return fmt.Errorf("%w: plan approved version id", storage.ErrInvalidArgument)
+	}
+	if plan.Sequence < 1 {
+		return fmt.Errorf("%w: plan sequence", storage.ErrInvalidArgument)
+	}
+	if plan.ConnectorName == "" {
+		return fmt.Errorf("%w: plan connector name", storage.ErrInvalidArgument)
+	}
+	if plan.ConnectorVersion == "" {
+		return fmt.Errorf("%w: plan connector version", storage.ErrInvalidArgument)
+	}
+	if _, ok := validPlanStates[string(plan.State)]; !ok {
+		return fmt.Errorf("%w: plan state %q", storage.ErrInvalidArgument, plan.State)
+	}
+	if plan.ContentHash == "" {
+		return fmt.Errorf("%w: plan content hash", storage.ErrInvalidArgument)
+	}
+	if len(plan.Content) == 0 {
+		return fmt.Errorf("%w: plan content", storage.ErrInvalidArgument)
+	}
+	if err := plan.GeneratedBy.Validate(); err != nil {
+		return fmt.Errorf("%w: %v", storage.ErrInvalidArgument, err)
+	}
+	if plan.GeneratedAt.IsZero() {
+		plan.GeneratedAt = time.Now().UTC()
+	}
+	for i, it := range items {
+		if it == nil {
+			return fmt.Errorf("%w: plan_items[%d] is nil", storage.ErrInvalidArgument, i)
+		}
+		if it.ID == "" {
+			return fmt.Errorf("%w: plan_items[%d].id", storage.ErrInvalidArgument, i)
+		}
+		if it.Sequence < 1 {
+			return fmt.Errorf("%w: plan_items[%d].sequence", storage.ErrInvalidArgument, i)
+		}
+		if _, ok := validPlanActions[it.Action]; !ok {
+			return fmt.Errorf("%w: plan_items[%d].action %q", storage.ErrInvalidArgument, i, it.Action)
+		}
+		if it.ResourceKind == "" {
+			return fmt.Errorf("%w: plan_items[%d].resource_kind", storage.ErrInvalidArgument, i)
+		}
+		if it.ResourceRef == "" {
+			return fmt.Errorf("%w: plan_items[%d].resource_ref", storage.ErrInvalidArgument, i)
+		}
+		if _, ok := validPlanRisks[it.Risk]; !ok {
+			return fmt.Errorf("%w: plan_items[%d].risk %q", storage.ErrInvalidArgument, i, it.Risk)
+		}
+	}
+
+	// AppendPlan must run in a transaction so the plan + items insert
+	// atomically. If we are already inside a tx (s.q is a pgx.Tx via
+	// WithTx) reuse it; otherwise open one for the duration.
+	if _, ok := s.q.(pgx.Tx); ok {
+		return s.appendPlanTx(ctx, plan, items)
+	}
+	if s.pool == nil {
+		// Defensive: Store with no pool and no tx is a programmer error.
+		return errors.New("postgres: AppendPlan called on Store with no pool and no tx")
+	}
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return fmt.Errorf("postgres: begin tx: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+	sub := &Store{pool: nil, q: tx}
+	if err := sub.appendPlanTx(ctx, plan, items); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("postgres: commit tx: %w", err)
+	}
+	committed = true
+	return nil
+}
+
+// appendPlanTx is the inner half of AppendPlan; assumes s.q is a tx.
+// It performs the plan insert and, only if a row was actually inserted
+// (i.e. ON CONFLICT did not skip), the items insert.
+func (s *Store) appendPlanTx(ctx context.Context, plan *domain.Plan, items []*domain.PlanItem) error {
+	const planQ = `
+INSERT INTO plans (
+  id, product_id, approved_version_id, sequence, connector_name,
+  connector_version, state, summary, content_hash, content,
+  refused_reason, generated_at, generated_by_kind, generated_by_subject
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11, $12, $13, $14)
+ON CONFLICT (approved_version_id, connector_name, content_hash) DO NOTHING
+RETURNING id
+`
+	var insertedID string
+	row := s.q.QueryRow(ctx, planQ,
+		string(plan.ID),
+		string(plan.ProductID),
+		string(plan.ApprovedVersionID),
+		plan.Sequence,
+		plan.ConnectorName,
+		plan.ConnectorVersion,
+		string(plan.State),
+		plan.Summary,
+		plan.ContentHash,
+		[]byte(plan.Content),
+		plan.RefusedReason,
+		plan.GeneratedAt,
+		string(plan.GeneratedBy.Kind),
+		plan.GeneratedBy.Subject,
+	)
+	if err := row.Scan(&insertedID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			// ON CONFLICT DO NOTHING fired: deterministic re-plan, the
+			// existing row stands, items are not re-inserted.
+			return nil
+		}
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) {
+			switch pgErr.Code {
+			case pgForeignKeyViolation:
+				return fmt.Errorf("%w: %s", storage.ErrNotFound, pgErr.ConstraintName)
+			case pgCheckViolation:
+				return fmt.Errorf("%w: %s", storage.ErrInvalidArgument, pgErr.ConstraintName)
+			}
+		}
+		return fmt.Errorf("postgres: insert plan: %w", err)
+	}
+
+	// We inserted a fresh plan row. Now persist its items in sequence
+	// order. plan_items.plan_id FK + UNIQUE(plan_id, sequence) protect
+	// us against duplication; everything else is application invariant.
+	const itemQ = `
+INSERT INTO plan_items (
+  id, plan_id, sequence, action, resource_kind, resource_ref, body, risk, note
+) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9)
+`
+	for _, it := range items {
+		body := jsonOrNullObject(it.Body)
+		_, err := s.q.Exec(ctx, itemQ,
+			string(it.ID),
+			string(plan.ID),
+			it.Sequence,
+			it.Action,
+			it.ResourceKind,
+			it.ResourceRef,
+			body,
+			it.Risk,
+			it.Note,
+		)
+		if err != nil {
+			var pgErr *pgconn.PgError
+			if errors.As(err, &pgErr) {
+				switch pgErr.Code {
+				case pgUniqueViolation:
+					return fmt.Errorf("%w: plan_items %s", storage.ErrAlreadyExists, pgErr.ConstraintName)
+				case pgForeignKeyViolation:
+					return fmt.Errorf("%w: %s", storage.ErrNotFound, pgErr.ConstraintName)
+				case pgCheckViolation:
+					return fmt.Errorf("%w: %s", storage.ErrInvalidArgument, pgErr.ConstraintName)
+				}
+			}
+			return fmt.Errorf("postgres: insert plan_item: %w", err)
+		}
+	}
+	return nil
+}
+
+// GetPlanByID returns the plan + ordered items, or ErrPlanNotFound if
+// no row matches id. Items are returned in sequence-ascending order so
+// the caller can render them deterministically.
+func (s *Store) GetPlanByID(ctx context.Context, id domain.ID) (*domain.Plan, []*domain.PlanItem, error) {
+	if id == "" {
+		return nil, nil, storage.ErrInvalidArgument
+	}
+	const planQ = `SELECT ` + planColumns + ` FROM plans WHERE id = $1`
+	plan, err := scanPlan(s.q.QueryRow(ctx, planQ, string(id)))
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			return nil, nil, storage.ErrPlanNotFound
+		}
+		return nil, nil, err
+	}
+
+	const itemsQ = `
+SELECT ` + planItemColumns + `
+  FROM plan_items
+ WHERE plan_id = $1
+ ORDER BY sequence ASC
+`
+	rows, err := s.q.Query(ctx, itemsQ, string(id))
+	if err != nil {
+		return nil, nil, fmt.Errorf("postgres: list plan_items: %w", err)
+	}
+	defer rows.Close()
+	items := make([]*domain.PlanItem, 0)
+	for rows.Next() {
+		it, err := scanPlanItem(rows)
+		if err != nil {
+			return nil, nil, err
+		}
+		items = append(items, it)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, nil, fmt.Errorf("postgres: iterate plan_items: %w", err)
+	}
+	return plan, items, nil
+}
+
+// ListPlansByProduct returns plans for productID newest first. limit
+// <= 0 means no limit. An empty slice (not an error) is returned when
+// the product has no plans.
+func (s *Store) ListPlansByProduct(ctx context.Context, productID domain.ID, limit int) ([]*domain.Plan, error) {
+	if productID == "" {
+		return nil, storage.ErrInvalidArgument
+	}
+	q := `
+SELECT ` + planColumns + `
+  FROM plans
+ WHERE product_id = $1
+ ORDER BY generated_at DESC, id DESC
+`
+	args := []any{string(productID)}
+	if limit > 0 {
+		args = append(args, limit)
+		q += " LIMIT $2"
+	}
+	rows, err := s.q.Query(ctx, q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: list plans: %w", err)
+	}
+	defer rows.Close()
+	out := make([]*domain.Plan, 0)
+	for rows.Next() {
+		p, err := scanPlan(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("postgres: iterate plans: %w", err)
+	}
+	return out, nil
+}
+
+// ListPlansByApprovedVersion returns every plan against the given
+// approved_version_id, newest first. An empty slice is returned (not
+// an error) when there are no rows.
+func (s *Store) ListPlansByApprovedVersion(ctx context.Context, approvedVersionID domain.ID) ([]*domain.Plan, error) {
+	if approvedVersionID == "" {
+		return nil, storage.ErrInvalidArgument
+	}
+	const q = `
+SELECT ` + planColumns + `
+  FROM plans
+ WHERE approved_version_id = $1
+ ORDER BY generated_at DESC, id DESC
+`
+	rows, err := s.q.Query(ctx, q, string(approvedVersionID))
+	if err != nil {
+		return nil, fmt.Errorf("postgres: list plans by version: %w", err)
+	}
+	defer rows.Close()
+	out := make([]*domain.Plan, 0)
+	for rows.Next() {
+		p, err := scanPlan(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("postgres: iterate plans: %w", err)
+	}
+	return out, nil
+}
+
+// UpdatePlanState transitions a plan's state. Callers pre-validate the
+// transition via domain.Plan.CanTransitionTo; this method only updates
+// columns. A non-empty reason populates refused_reason; otherwise the
+// existing value is preserved (so a re-Refused with empty reason does
+// not blank prior context). Returns ErrPlanNotFound if no row matches
+// id.
+func (s *Store) UpdatePlanState(ctx context.Context, id domain.ID, state domain.PlanState, reason string) error {
+	if id == "" {
+		return storage.ErrInvalidArgument
+	}
+	if _, ok := validPlanStates[string(state)]; !ok {
+		return fmt.Errorf("%w: plan state %q", storage.ErrInvalidArgument, state)
+	}
+	const q = `
+UPDATE plans
+   SET state          = $2,
+       refused_reason = CASE WHEN $3 <> '' THEN $3 ELSE refused_reason END
+ WHERE id = $1
+`
+	tag, err := s.q.Exec(ctx, q, string(id), string(state), reason)
+	if err != nil {
+		return fmt.Errorf("postgres: update plan state: %w", classifyErr(err))
+	}
+	if tag.RowsAffected() == 0 {
+		return storage.ErrPlanNotFound
+	}
+	return nil
+}
+
+func scanPlan(r scannable) (*domain.Plan, error) {
+	var (
+		id, productID, approvedVersionID    string
+		sequence                            int64
+		connectorName, connectorVersion     string
+		state, summary, contentHash         string
+		contentRaw                          []byte
+		refusedReason                       string
+		generatedAt                         time.Time
+		generatedByKind, generatedBySubject string
+	)
+	err := r.Scan(
+		&id, &productID, &approvedVersionID, &sequence, &connectorName,
+		&connectorVersion, &state, &summary, &contentHash, &contentRaw,
+		&refusedReason, &generatedAt, &generatedByKind, &generatedBySubject,
+	)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, storage.ErrNotFound
+		}
+		return nil, fmt.Errorf("postgres: scan plan: %w", err)
+	}
+	plan := &domain.Plan{
+		ID:                domain.ID(id),
+		ProductID:         domain.ID(productID),
+		ApprovedVersionID: domain.ID(approvedVersionID),
+		Sequence:          sequence,
+		ConnectorName:     connectorName,
+		ConnectorVersion:  connectorVersion,
+		State:             domain.PlanState(state),
+		Summary:           summary,
+		ContentHash:       contentHash,
+		RefusedReason:     refusedReason,
+		GeneratedAt:       generatedAt,
+		GeneratedBy: domain.Actor{
+			Kind:    domain.ActorKind(generatedByKind),
+			Subject: generatedBySubject,
+		},
+	}
+	if len(contentRaw) > 0 {
+		plan.Content = json.RawMessage(append([]byte(nil), contentRaw...))
+	}
+	return plan, nil
+}
+
+func scanPlanItem(r scannable) (*domain.PlanItem, error) {
+	var (
+		id, planID, action, resourceKind, resourceRef, risk, note string
+		sequence                                                  int
+		bodyRaw                                                   []byte
+	)
+	err := r.Scan(&id, &planID, &sequence, &action, &resourceKind, &resourceRef, &bodyRaw, &risk, &note)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, storage.ErrNotFound
+		}
+		return nil, fmt.Errorf("postgres: scan plan_item: %w", err)
+	}
+	item := &domain.PlanItem{
+		ID:           domain.ID(id),
+		PlanID:       domain.ID(planID),
+		Sequence:     sequence,
+		Action:       action,
+		ResourceKind: resourceKind,
+		ResourceRef:  resourceRef,
+		Risk:         risk,
+		Note:         note,
+	}
+	if len(bodyRaw) > 0 {
+		item.Body = json.RawMessage(append([]byte(nil), bodyRaw...))
+	}
+	return item, nil
+}
+
 // Compile-time assertion that *Store satisfies storage.Storage.
 var _ storage.Storage = (*Store)(nil)

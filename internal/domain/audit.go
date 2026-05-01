@@ -35,6 +35,9 @@ const (
 	EventGlobalObjectDeleted    EventKind = "global_object.deleted"
 	EventGlobalObjectUpdated    EventKind = "global_object.updated"
 	EventModelImported          EventKind = "model.imported"
+	EventPlanGenerated          EventKind = "plan.generated"
+	EventPlanReady              EventKind = "plan.ready"
+	EventPlanRefused            EventKind = "plan.refused"
 	// EventPolicyEvaluated is emitted by internal/authz after every OPA
 	// evaluation of a ChangeSet (Phase 2 wave B). The payload carries the
 	// decision id, change set id, phase, outcome, bundle hash, and a compact

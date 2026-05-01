@@ -30,7 +30,7 @@ var topLevelSections = []sectionEntry{
 	{name: "Authorizations", phase: "Phase 1"},
 	{name: "Change Sets", phase: "Phase 2", available: true},
 	{name: "Approvals", phase: "Phase 2", available: true},
-	{name: "Plans", phase: "Phase 4"},
+	{name: "Plans", phase: "Phase 4", available: true},
 	{name: "Drift Findings", phase: "Phase 4'"},
 	{name: "Evidence Packs", phase: "Phase 3", available: true},
 	{name: "Connectors", phase: "Phase 4"},
@@ -107,6 +107,12 @@ func (s sectionsScreen) Update(msg tea.Msg) (screen, tea.Cmd) {
 			)
 		case "Evidence Packs":
 			next := newEvidenceScreen(s.store)
+			return s, tea.Batch(
+				func() tea.Msg { return pushScreenMsg{s: next} },
+				next.Init(),
+			)
+		case "Plans":
+			next := newPlansScreen(s.store)
 			return s, tea.Batch(
 				func() tea.Msg { return pushScreenMsg{s: next} },
 				next.Init(),
