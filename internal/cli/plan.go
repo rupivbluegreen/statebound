@@ -261,7 +261,21 @@ func runPlan(ctx context.Context, store storage.Storage, stdout, stderr io.Write
 	}
 
 	// 10. Persist plan + items + audit events in one transaction.
+	//     Idempotency: a re-plan with identical (av, connector,
+	//     content_hash) is treated as a no-op — we surface the existing
+	//     plan id rather than minting a new one and emitting ghost
+	//     audit events that reference an unpersisted plan.
+	var reusedExisting bool
 	if err := store.WithTx(ctx, func(tx storage.Storage) error {
+		existing, err := findExistingPlan(ctx, tx, av.ID, conn.Name(), plan.ContentHash)
+		if err != nil {
+			return err
+		}
+		if existing != nil {
+			plan = existing
+			reusedExisting = true
+			return nil
+		}
 		if err := tx.AppendPlan(ctx, plan, domainItems); err != nil {
 			return fmt.Errorf("append plan: %w", err)
 		}
@@ -341,8 +355,29 @@ func runPlan(ctx context.Context, store storage.Storage, stdout, stderr io.Write
 	if plan.State == domain.PlanStateRefused {
 		summary += "; refused: " + plan.RefusedReason
 	}
+	if reusedExisting {
+		summary += " (reused existing plan)"
+	}
 	_, err = fmt.Fprintln(stderr, summary)
 	return err
+}
+
+// findExistingPlan looks up a previously-persisted plan with the same
+// (approved_version, connector_name, content_hash). Phase 6 idempotency:
+// re-running plan against the same inputs surfaces the existing plan
+// rather than minting a new id whose audit events would reference a row
+// that AppendPlan's ON CONFLICT DO NOTHING never inserted.
+func findExistingPlan(ctx context.Context, tx storage.Storage, avID domain.ID, connector, contentHash string) (*domain.Plan, error) {
+	plans, err := tx.ListPlansByApprovedVersion(ctx, avID)
+	if err != nil {
+		return nil, fmt.Errorf("list plans for av: %w", err)
+	}
+	for _, p := range plans {
+		if p.ConnectorName == connector && p.ContentHash == contentHash {
+			return p, nil
+		}
+	}
+	return nil, nil
 }
 
 // buildSyntheticPlanItems re-projects the model's entitlements and service
