@@ -1,0 +1,33 @@
+# Statebound local-development docker-compose.
+#
+# Phase 0 ships only the PostgreSQL service. The statebound binary itself
+# runs locally during development (via `make run-api`, `make run-tui`, or
+# a freshly-built ./bin/statebound) and connects to this database over
+# localhost:5432. Later phases may add a service for the binary itself,
+# along with sidecars for connectors. Until then this file stays minimal.
+#
+# The values below are inline (not pulled from .env) so a fresh checkout
+# comes up with `make docker-up` and zero extra setup. The .env.example
+# alongside this file documents the variables the binary itself reads.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: statebound-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: statebound
+      POSTGRES_PASSWORD: statebound
+      POSTGRES_DB: statebound
+    ports:
+      - "5432:5432"
+    volumes:
+      - statebound-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U statebound -d statebound"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  statebound-pgdata: {}

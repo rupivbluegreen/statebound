@@ -1,0 +1,42 @@
+# Binaries built locally.
+/bin/
+/dist/
+/statebound
+/statebound-reason
+
+# Go test/build caches when run outside the Docker wrapper.
+*.test
+*.out
+coverage.txt
+
+# Local docker-compose volumes / overrides.
+/deploy/docker-compose/.data/
+/deploy/docker-compose/docker-compose.override.yml
+
+# Editor / OS noise.
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+
+# Local secrets — Statebound never stores secrets, but contributors may keep
+# kubeconfigs, TLS certs, or scratch creds locally. Keep them out of git.
+.env
+.env.local
+*.pem
+*.key
+
+# Generated artifacts that should not live in git.
+schemas/openapi.gen.go
+schemas/*.gen.go
+internal/storage/sqlc/
+
+# Local-only project state.
+/.claude/
+/.remember/
+
+# ADRs and the operating manual are kept locally but not tracked publicly
+# until trademark clearance (per the project's rename rationale).
+/docs/adr/
+/CLAUDE.md
