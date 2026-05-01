@@ -10,10 +10,28 @@ import (
 type EventKind string
 
 const (
-	EventProductCreated EventKind = "product.created"
-	EventProductUpdated EventKind = "product.updated"
-	EventProductDeleted EventKind = "product.deleted"
-	EventModelImported  EventKind = "model.imported"
+	EventAssetCreated             EventKind = "asset.created"
+	EventAssetDeleted             EventKind = "asset.deleted"
+	EventAssetScopeCreated        EventKind = "asset_scope.created"
+	EventAssetScopeDeleted        EventKind = "asset_scope.deleted"
+	EventAssetScopeUpdated        EventKind = "asset_scope.updated"
+	EventAssetUpdated             EventKind = "asset.updated"
+	EventAuthorizationCreated     EventKind = "authorization.created"
+	EventAuthorizationDeleted     EventKind = "authorization.deleted"
+	EventAuthorizationUpdated     EventKind = "authorization.updated"
+	EventEntitlementCreated       EventKind = "entitlement.created"
+	EventEntitlementDeleted       EventKind = "entitlement.deleted"
+	EventEntitlementUpdated       EventKind = "entitlement.updated"
+	EventGlobalObjectCreated      EventKind = "global_object.created"
+	EventGlobalObjectDeleted      EventKind = "global_object.deleted"
+	EventGlobalObjectUpdated      EventKind = "global_object.updated"
+	EventModelImported            EventKind = "model.imported"
+	EventProductCreated           EventKind = "product.created"
+	EventProductDeleted           EventKind = "product.deleted"
+	EventProductUpdated           EventKind = "product.updated"
+	EventServiceAccountCreated    EventKind = "service_account.created"
+	EventServiceAccountDeleted    EventKind = "service_account.deleted"
+	EventServiceAccountUpdated    EventKind = "service_account.updated"
 )
 
 // Sentinel errors for AuditEvent validation.

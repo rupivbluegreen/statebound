@@ -1,0 +1,41 @@
+# Intentionally broken; used by 'statebound validate -f ...' demo.
+apiVersion: statebound.dev/v1alpha1
+kind: ProductAuthorizationModel
+metadata:
+  product: payments-api
+  # owner: platform-security    # FAILURE 1: required metadata.owner is missing.
+  description: Card-payments API governance baseline
+spec:
+  assets:
+    - name: pay-linux-01
+      type: linux-host
+      environment: prod
+      labels:
+        app: payments
+        region: eu
+
+  assetScopes:
+    - name: prod-linux
+      selector:
+        type: linux-host
+        environment: prod
+        app: payments
+
+  entitlements:
+    - name: payments-prod-readonly
+      owner: payments-team
+      purpose: Read-only production troubleshooting
+      authorizations:
+        - type: linux.ssh
+          scope: not-a-real-scope    # FAILURE 2: references a scope that does not exist.
+          methods: [ssh]
+
+  serviceAccounts:
+    - name: payments-batch
+      owner: payments-team
+      usagePattern: system-to-system
+      purpose: Runs scheduled settlement jobs
+      authorizations:
+        - type: linux.local-group
+          scope: prod-linux
+          # group: payments-runtime    # FAILURE 3: linux.local-group requires `group`.

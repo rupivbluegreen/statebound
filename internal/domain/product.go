@@ -2,13 +2,8 @@ package domain
 
 import (
 	"errors"
-	"regexp"
 	"time"
 )
-
-// productNameRe matches lower-kebab slugs: 1..63 chars, must start with [a-z0-9].
-// Keep this regex in sync with the SQL CHECK constraint in migrations/0001_init.sql.
-var productNameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,62}$`)
 
 const productDescriptionMaxLen = 1024
 
@@ -31,7 +26,7 @@ type Product struct {
 
 // IsValidProductName reports whether s satisfies the product name slug rules.
 func IsValidProductName(s string) bool {
-	return productNameRe.MatchString(s)
+	return validName(s)
 }
 
 // NewProduct constructs and validates a Product, assigning a fresh ID and timestamps.

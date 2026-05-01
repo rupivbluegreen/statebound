@@ -12,10 +12,28 @@ func validActor() Actor {
 
 func TestNewAuditEvent_Valid(t *testing.T) {
 	kinds := []EventKind{
-		EventProductCreated,
-		EventProductUpdated,
-		EventProductDeleted,
+		EventAssetCreated,
+		EventAssetDeleted,
+		EventAssetScopeCreated,
+		EventAssetScopeDeleted,
+		EventAssetScopeUpdated,
+		EventAssetUpdated,
+		EventAuthorizationCreated,
+		EventAuthorizationDeleted,
+		EventAuthorizationUpdated,
+		EventEntitlementCreated,
+		EventEntitlementDeleted,
+		EventEntitlementUpdated,
+		EventGlobalObjectCreated,
+		EventGlobalObjectDeleted,
+		EventGlobalObjectUpdated,
 		EventModelImported,
+		EventProductCreated,
+		EventProductDeleted,
+		EventProductUpdated,
+		EventServiceAccountCreated,
+		EventServiceAccountDeleted,
+		EventServiceAccountUpdated,
 	}
 	for _, k := range kinds {
 		t.Run(string(k), func(t *testing.T) {
@@ -150,6 +168,38 @@ func TestAuditEvent_Validate(t *testing.T) {
 				t.Errorf("Validate err = %v, want errors.Is == %v", err, tc.want)
 			}
 		})
+	}
+}
+
+func TestEventKind_Values(t *testing.T) {
+	cases := map[EventKind]string{
+		EventAssetCreated:          "asset.created",
+		EventAssetUpdated:          "asset.updated",
+		EventAssetDeleted:          "asset.deleted",
+		EventAssetScopeCreated:     "asset_scope.created",
+		EventAssetScopeUpdated:     "asset_scope.updated",
+		EventAssetScopeDeleted:     "asset_scope.deleted",
+		EventEntitlementCreated:    "entitlement.created",
+		EventEntitlementUpdated:    "entitlement.updated",
+		EventEntitlementDeleted:    "entitlement.deleted",
+		EventServiceAccountCreated: "service_account.created",
+		EventServiceAccountUpdated: "service_account.updated",
+		EventServiceAccountDeleted: "service_account.deleted",
+		EventGlobalObjectCreated:   "global_object.created",
+		EventGlobalObjectUpdated:   "global_object.updated",
+		EventGlobalObjectDeleted:   "global_object.deleted",
+		EventAuthorizationCreated:  "authorization.created",
+		EventAuthorizationUpdated:  "authorization.updated",
+		EventAuthorizationDeleted:  "authorization.deleted",
+		EventProductCreated:        "product.created",
+		EventProductUpdated:        "product.updated",
+		EventProductDeleted:        "product.deleted",
+		EventModelImported:         "model.imported",
+	}
+	for k, want := range cases {
+		if string(k) != want {
+			t.Errorf("EventKind value = %q, want %q", string(k), want)
+		}
 	}
 }
 

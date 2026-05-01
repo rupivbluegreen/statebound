@@ -4,9 +4,20 @@ package domain
 import (
 	"errors"
 	"fmt"
+	"regexp"
 
 	"github.com/google/uuid"
 )
+
+// nameRe matches the cross-cutting kebab-slug pattern used for Names across
+// Products, Assets, AssetScopes, Entitlements, ServiceAccounts, GlobalObjects.
+// Keep this regex in sync with any SQL CHECK constraints in migrations.
+var nameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,62}$`)
+
+// validName reports whether s is a valid kebab-slug name (1..63 chars, [a-z0-9-]).
+func validName(s string) bool {
+	return nameRe.MatchString(s)
+}
 
 // ID is a UUID-v4 identifier rendered as a canonical string.
 type ID string

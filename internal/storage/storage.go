@@ -10,9 +10,10 @@ import (
 
 // Sentinel errors mapped from concrete drivers so callers do not depend on pgx.
 var (
-	ErrNotFound      = errors.New("storage: not found")
-	ErrAlreadyExists = errors.New("storage: already exists")
-	ErrConflict      = errors.New("storage: conflict")
+	ErrNotFound        = errors.New("storage: not found")
+	ErrAlreadyExists   = errors.New("storage: already exists")
+	ErrConflict        = errors.New("storage: conflict")
+	ErrInvalidArgument = errors.New("storage: invalid argument")
 )
 
 // AuditFilter narrows ListAuditEvents results. A zero Limit means no limit.
@@ -39,10 +40,84 @@ type AuditStore interface {
 	ListAuditEvents(ctx context.Context, f AuditFilter) ([]*domain.AuditEvent, error)
 }
 
+// AssetStore persists Assets owned by a Product.
+type AssetStore interface {
+	CreateAsset(ctx context.Context, a *domain.Asset) error
+	GetAssetByID(ctx context.Context, id domain.ID) (*domain.Asset, error)
+	GetAssetByName(ctx context.Context, productID domain.ID, name string) (*domain.Asset, error)
+	ListAssetsByProduct(ctx context.Context, productID domain.ID) ([]*domain.Asset, error)
+	UpdateAsset(ctx context.Context, a *domain.Asset) error
+	DeleteAsset(ctx context.Context, id domain.ID) error
+}
+
+// AssetScopeStore persists AssetScopes owned by a Product.
+type AssetScopeStore interface {
+	CreateAssetScope(ctx context.Context, s *domain.AssetScope) error
+	GetAssetScopeByID(ctx context.Context, id domain.ID) (*domain.AssetScope, error)
+	GetAssetScopeByName(ctx context.Context, productID domain.ID, name string) (*domain.AssetScope, error)
+	ListAssetScopesByProduct(ctx context.Context, productID domain.ID) ([]*domain.AssetScope, error)
+	UpdateAssetScope(ctx context.Context, s *domain.AssetScope) error
+	DeleteAssetScope(ctx context.Context, id domain.ID) error
+}
+
+// EntitlementStore persists Entitlements owned by a Product.
+type EntitlementStore interface {
+	CreateEntitlement(ctx context.Context, e *domain.Entitlement) error
+	GetEntitlementByID(ctx context.Context, id domain.ID) (*domain.Entitlement, error)
+	GetEntitlementByName(ctx context.Context, productID domain.ID, name string) (*domain.Entitlement, error)
+	ListEntitlementsByProduct(ctx context.Context, productID domain.ID) ([]*domain.Entitlement, error)
+	UpdateEntitlement(ctx context.Context, e *domain.Entitlement) error
+	DeleteEntitlement(ctx context.Context, id domain.ID) error
+}
+
+// ServiceAccountStore persists ServiceAccounts owned by a Product.
+type ServiceAccountStore interface {
+	CreateServiceAccount(ctx context.Context, sa *domain.ServiceAccount) error
+	GetServiceAccountByID(ctx context.Context, id domain.ID) (*domain.ServiceAccount, error)
+	GetServiceAccountByName(ctx context.Context, productID domain.ID, name string) (*domain.ServiceAccount, error)
+	ListServiceAccountsByProduct(ctx context.Context, productID domain.ID) ([]*domain.ServiceAccount, error)
+	UpdateServiceAccount(ctx context.Context, sa *domain.ServiceAccount) error
+	DeleteServiceAccount(ctx context.Context, id domain.ID) error
+}
+
+// GlobalObjectStore persists GlobalObjects, optionally scoped to a Product (nil = cross-product).
+type GlobalObjectStore interface {
+	CreateGlobalObject(ctx context.Context, g *domain.GlobalObject) error
+	GetGlobalObjectByID(ctx context.Context, id domain.ID) (*domain.GlobalObject, error)
+	// GetGlobalObjectByName looks up by (productID, name). Pass productID = nil for cross-product objects.
+	GetGlobalObjectByName(ctx context.Context, productID *domain.ID, name string) (*domain.GlobalObject, error)
+	// ListGlobalObjectsByProduct returns all global objects with the given product scope.
+	// Pass productID = nil to list cross-product (NULL product_id) objects only.
+	ListGlobalObjectsByProduct(ctx context.Context, productID *domain.ID) ([]*domain.GlobalObject, error)
+	// ListAllGlobalObjects returns every global object regardless of product scope.
+	ListAllGlobalObjects(ctx context.Context) ([]*domain.GlobalObject, error)
+	UpdateGlobalObject(ctx context.Context, g *domain.GlobalObject) error
+	DeleteGlobalObject(ctx context.Context, id domain.ID) error
+}
+
+// AuthorizationStore persists Authorizations. Authorizations have no Update method:
+// callers (notably the importer) delete and recreate when re-syncing.
+type AuthorizationStore interface {
+	CreateAuthorization(ctx context.Context, a *domain.Authorization) error
+	GetAuthorizationByID(ctx context.Context, id domain.ID) (*domain.Authorization, error)
+	ListAuthorizationsByParent(ctx context.Context, parentKind domain.AuthorizationParentKind, parentID domain.ID) ([]*domain.Authorization, error)
+	DeleteAuthorization(ctx context.Context, id domain.ID) error
+}
+
 // Storage is the aggregate persistence boundary used by the application layer.
 type Storage interface {
 	ProductStore
 	AuditStore
+	AssetStore
+	AssetScopeStore
+	EntitlementStore
+	ServiceAccountStore
+	GlobalObjectStore
+	AuthorizationStore
 	Close(ctx context.Context) error
 	Ping(ctx context.Context) error
+	// WithTx runs fn inside a database transaction. The Storage handed to fn issues
+	// every query inside the same transaction. Returning a non-nil error rolls back;
+	// nil commits. Panics in fn cause rollback and re-panic.
+	WithTx(ctx context.Context, fn func(tx Storage) error) error
 }
