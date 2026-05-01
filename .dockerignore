@@ -1,0 +1,63 @@
+# .dockerignore — keep the build context small. The Docker build reaches
+# in for source, go.mod/go.sum, policies/, and schemas/; everything else
+# is host noise that would only invalidate the build cache.
+
+# Git history.
+.git
+.gitignore
+.github
+
+# Local binaries and build outputs.
+/bin/
+/dist/
+/statebound
+/statebound-reason
+
+# Go test/build caches.
+*.test
+*.out
+coverage.txt
+
+# Persistent Go module / build caches mounted by scripts/go.sh.
+/.gocache/
+/.gomodcache/
+/.config/
+
+# Local docker-compose volumes / overrides — irrelevant inside the build
+# context and cycles content frequently.
+/deploy/docker-compose/.data/
+/deploy/docker-compose/docker-compose.override.yml
+
+# Editor / OS noise.
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+
+# Local secrets — never put a credential in a layer.
+.env
+.env.local
+*.pem
+*.key
+
+# Generated artifacts, regenerated inside the builder stage.
+schemas/openapi.gen.go
+schemas/*.gen.go
+internal/storage/sqlc/
+
+# Local-only project state.
+/.claude/
+/.remember/
+
+# ADRs + operating manual stay out of the published image — see
+# .gitignore for the policy.
+/docs/adr/
+/CLAUDE.md
+
+# Helm chart and threat-model docs are not needed inside the image
+# itself (they ship in deploy/helm/), but we leave them in the build
+# context because the docs are tiny and operators may want to read them
+# inside a debug shell. To shrink the context further, uncomment:
+# /deploy/helm
+# /docs

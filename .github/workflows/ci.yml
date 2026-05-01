@@ -255,3 +255,53 @@ jobs:
           test "$(curl -s -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer wrong' http://127.0.0.1:18080/v1/products)" = "401"
           kill $API_PID
           wait $API_PID 2>/dev/null || true
+
+  # Phase 8 wave C: build the multi-stage Dockerfile and smoke-test the
+  # resulting distroless image. The image bakes in v1.0 metadata via
+  # -ldflags and runs as the non-root distroless `nonroot` user. We
+  # exercise the two subcommands that don't require a database: `version`
+  # and `--help`. Anything DB-touching is covered by the build-test job.
+  docker-build:
+    runs-on: ubuntu-latest
+    needs: build-test
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Sync Rego bundle into authz embed
+        run: cp policies/builtin/*.rego internal/authz/bundle/
+
+      - name: Sync OpenAPI spec into api embed
+        run: cp schemas/openapi.yaml internal/api/openapi.yaml
+
+      - name: Build the statebound image
+        run: |
+          docker build \
+            --build-arg VERSION=v1.0.0 \
+            --build-arg COMMIT=${GITHUB_SHA} \
+            --build-arg BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ) \
+            -t statebound:ci \
+            .
+
+      - name: Smoke test — version subcommand
+        run: |
+          out=$(docker run --rm statebound:ci version)
+          echo "$out"
+          echo "$out" | grep -qE 'statebound v1\.0\.0'
+          echo "$out" | grep -qE 'commit '
+          echo "$out" | grep -qE 'go go1\.'
+
+      - name: Smoke test — help text
+        run: |
+          # Distroless has no shell, so we can't pipe to head. Print
+          # the full help text, then verify the expected first-page
+          # token is present.
+          out=$(docker run --rm statebound:ci --help)
+          echo "$out" | head -20
+          echo "$out" | grep -q 'statebound'
+          echo "$out" | grep -q 'Available Commands'
+
+      - name: Image size report
+        run: |
+          docker images statebound:ci --format 'table {{.Repository}}\t{{.Tag}}\t{{.Size}}'

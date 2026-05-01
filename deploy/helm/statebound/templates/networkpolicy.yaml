@@ -1,0 +1,38 @@
+{{- if .Values.networkPolicy.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "statebound.fullname" . }}
+  labels:
+    {{- include "statebound.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "statebound.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        {{- range .Values.networkPolicy.ingressFrom }}
+        - {{- if . }}
+            {{- toYaml . | nindent 12 }}
+          {{- else }} {}
+          {{- end }}
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.service.containerPort }}
+  egress:
+    # DNS
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Postgres + everything else (OIDC issuer, OTel collector, etc.).
+    # Operators tighten this in their own values overlay.
+    - {}
+{{- end }}

@@ -1,0 +1,39 @@
+apiVersion: v2
+name: statebound
+description: |
+  Statebound is a terminal-native, open-source desired-state authorization
+  governance platform for regulated infrastructure and applications. This
+  chart deploys the deterministic core (the `statebound` binary) which
+  exposes a read-only HTTP API, runs goose migrations on install, and
+  authenticates either via OIDC bearer tokens or a dev-token.
+
+  This chart does NOT bundle PostgreSQL. Operators bring their own
+  PostgreSQL instance and pass connection details through values.
+
+type: application
+
+# Chart version (semver) — incremented per chart change.
+version: 0.1.0
+
+# AppVersion (the statebound binary version) — tracks the v1.0 release.
+appVersion: "1.0.0"
+
+home: https://github.com/rupivbluegreen/statebound
+sources:
+  - https://github.com/rupivbluegreen/statebound
+
+keywords:
+  - authorization
+  - governance
+  - compliance
+  - audit
+  - opa
+  - rego
+
+maintainers:
+  - name: rupivbluegreen
+    url: https://github.com/rupivbluegreen
+
+annotations:
+  category: Security
+  licenses: Apache-2.0

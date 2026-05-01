@@ -1,0 +1,204 @@
+# Default values for the statebound Helm chart.
+#
+# This file is the operator-facing API for deploying the deterministic
+# core into Kubernetes. The chart does NOT bundle PostgreSQL: regulated
+# environments invariably wire to a managed RDS / CloudSQL instance, so
+# wedging Postgres into the chart would just create a second hop the
+# operator has to override.
+#
+# All values are documented inline. The chart fails fast with a clear
+# error if a required value is missing — see templates/_helpers.tpl.
+
+image:
+  repository: ghcr.io/rupivbluegreen/statebound
+  # When empty, _helpers.tpl falls back to .Chart.AppVersion (1.0.0).
+  tag: ""
+  pullPolicy: IfNotPresent
+  pullSecrets: []
+
+# How many statebound API pods to run. The core is stateless (state of
+# record lives in Postgres); horizontal scaling is safe and idempotent.
+replicaCount: 1
+
+service:
+  type: ClusterIP
+  port: 8080
+  # Optional: set a different port the container listens on. Most
+  # operators leave this at 8080 and use the service port to remap.
+  containerPort: 8080
+  annotations: {}
+
+api:
+  # Bind address inside the container. Leading colon = all interfaces.
+  listen: ":8080"
+  readTimeout: "15s"
+  writeTimeout: "30s"
+  logLevel: "info"
+
+  # OIDC bearer-token auth. Set issuer + audience to enable. When both
+  # are empty the chart requires devToken to be set instead.
+  oidc:
+    issuer: ""
+    audience: ""
+    # Optional: JWKS URL override. By default the binary discovers
+    # JWKS from {issuer}/.well-known/openid-configuration.
+    jwksURL: ""
+
+  # Dev-token auth. Accepts a single bearer token; every request
+  # authenticated with it acts as devActor. This is appropriate for
+  # local dev and air-gapped demos. NEVER use in production with
+  # untrusted network reach.
+  devToken: ""
+  devActor: "human:dev"
+
+database:
+  # Full DSN takes precedence. When empty the chart assembles a DSN
+  # from host/port/database/user + the password loaded from the
+  # secret reference below.
+  dsn: ""
+  host: "postgres"
+  port: 5432
+  database: "statebound"
+  user: "statebound"
+  sslmode: "require"
+
+  # Reference to a Kubernetes secret containing the database
+  # password. The chart never inlines passwords.
+  passwordSecretRef:
+    name: ""
+    key: "password"
+
+# Run goose migrations as a one-shot Job before the main Deployment
+# starts. Disabling this is appropriate when the operator runs
+# migrations out-of-band (e.g. as part of their CI/CD pipeline) — in
+# that case the Deployment will fail liveness/readiness probes until
+# migrations are applied externally.
+migrations:
+  enabled: true
+  # Image used for the migrations Job. Defaults to a pinned goose
+  # image; operators with internal-mirror requirements override.
+  image:
+    repository: ghcr.io/pressly/goose
+    tag: "3.27.0-alpine"
+    pullPolicy: IfNotPresent
+  # Path inside the migrations container where the chart mounts
+  # the migrations directory. The chart relies on the operator
+  # baking the migrations into the goose container or mounting a
+  # ConfigMap themselves; for v0.1 the chart documents this gap.
+  hookWeight: "-5"
+
+# OpenTelemetry tracing. OFF by default. Set exporter to
+# "otlp-grpc", "otlp-http", or "stdout" to enable.
+telemetry:
+  exporter: ""
+  endpoint: ""
+  insecure: true
+  serviceName: "statebound"
+  sampleRatio: ""
+
+# Plan-bundle signing. v1.0 emits Ed25519-signed plan bundles. The
+# private key never enters the chart; operators provide a secret
+# reference. devSkip exists for development clusters only — the
+# chart fails to render if devSkip=true and oidc.issuer is set, on
+# the assumption that any cluster with real OIDC should also have
+# real signing.
+signing:
+  keyId: ""
+  privateKeySecretRef:
+    name: ""
+    key: "private_key.pem"
+  devSkip: false
+
+resources:
+  limits:
+    cpu: "500m"
+    memory: "512Mi"
+  requests:
+    cpu: "100m"
+    memory: "128Mi"
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# Pod-level security context — non-root, read-only root filesystem,
+# all capabilities dropped. Distroless gives us this for free; we
+# also assert it explicitly so a future image swap can't quietly
+# regress.
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+
+containerSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop: [ALL]
+  seccompProfile:
+    type: RuntimeDefault
+
+probes:
+  liveness:
+    path: /healthz
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    timeoutSeconds: 3
+    failureThreshold: 3
+  readiness:
+    path: /readyz
+    initialDelaySeconds: 5
+    periodSeconds: 5
+    timeoutSeconds: 3
+    failureThreshold: 3
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: statebound.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 5
+  targetCPUUtilizationPercentage: 75
+  # targetMemoryUtilizationPercentage: 75
+
+# A NetworkPolicy that allows ingress only from the same namespace by
+# default. Set additional ingressFrom entries to allow ingress from
+# specific namespaces or pod selectors. Disable entirely with
+# enabled: false (not recommended for production).
+networkPolicy:
+  enabled: true
+  ingressFrom:
+    - {}
+
+# Pod / Deployment annotations. Useful for vault-agent injection,
+# linkerd, etc.
+podAnnotations: {}
+podLabels: {}
+
+# ServiceAccount for the workload. By default the chart creates
+# a dedicated SA with no extra RBAC.
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+  automount: false
+
+# Test pod (helm test) settings. Enables a one-shot pod that curls
+# /healthz against the freshly-installed service.
+tests:
+  image:
+    repository: curlimages/curl
+    tag: "8.10.1"
+    pullPolicy: IfNotPresent

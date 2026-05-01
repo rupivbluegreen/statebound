@@ -1,14 +1,17 @@
 # Statebound local-development docker-compose.
 #
-# Phase 0 ships only the PostgreSQL service. The statebound binary itself
-# runs locally during development (via `make run-api`, `make run-tui`, or
-# a freshly-built ./bin/statebound) and connects to this database over
-# localhost:5432. Later phases may add a service for the binary itself,
-# along with sidecars for connectors. Until then this file stays minimal.
+# Phase 8 wave C ships two services: PostgreSQL and the statebound API
+# (built from the repo-root Dockerfile). Operators can run the full
+# v1.0 deterministic demo with:
 #
-# The values below are inline (not pulled from .env) so a fresh checkout
-# comes up with `make docker-up` and zero extra setup. The .env.example
-# alongside this file documents the variables the binary itself reads.
+#   make docker-app-up         # build image, start Postgres + API
+#   curl http://localhost:8080/healthz
+#   make docker-app-down       # tear it all down
+#
+# The standalone `make docker-up` / `make docker-down` flow still
+# starts only Postgres (the statebound service is ignored when not
+# requested by name) so contributors who run the binary on the host
+# via `make run-api` are unaffected.
 
 services:
   postgres:
@@ -28,6 +31,45 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+
+  statebound:
+    image: statebound:dev
+    container_name: statebound-api
+    build:
+      # Build from the repo root so the Dockerfile can see go.mod,
+      # cmd/, internal/, policies/, schemas/, etc.
+      context: ../..
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # The compose Postgres uses statebound/statebound; this DSN
+      # matches the canonical default in the top-level Makefile.
+      STATEBOUND_DB_DSN: postgres://statebound:statebound@postgres:5432/statebound?sslmode=disable
+      # Dev-token auth: the API requires either OIDC config or a
+      # dev token. Compose is for local development, so we set the
+      # dev token. Override for any non-local environment.
+      STATEBOUND_DEV_TOKEN: local-dev
+      STATEBOUND_DEV_ACTOR: human:dev
+      # Plan signing requires a key on disk; the compose flow does
+      # not provision one. Skip signing locally — never set this in
+      # production.
+      STATEBOUND_DEV_SKIP_PLAN_SIGNATURE: "true"
+      # Bind to all interfaces inside the container so the host port
+      # forward can reach it.
+      STATEBOUND_API_LISTEN: ":8080"
+    ports:
+      - "8080:8080"
+    # Distroless does not include a shell, so a healthcheck has to
+    # invoke the statebound binary directly. `version` is the smallest
+    # subcommand that proves the binary still runs.
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/statebound", "version"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
 volumes:
   statebound-pgdata: {}

@@ -1,0 +1,53 @@
+{{- include "statebound.assertAuthConfigured" . -}}
+{{- include "statebound.assertSigningSane" . -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "statebound.fullname" . }}-config
+  labels:
+    {{- include "statebound.labels" . | nindent 4 }}
+data:
+  STATEBOUND_API_LISTEN: {{ .Values.api.listen | quote }}
+  STATEBOUND_API_READ_TIMEOUT: {{ .Values.api.readTimeout | quote }}
+  STATEBOUND_API_WRITE_TIMEOUT: {{ .Values.api.writeTimeout | quote }}
+  STATEBOUND_LOG_LEVEL: {{ .Values.api.logLevel | quote }}
+  {{- with .Values.api.oidc.issuer }}
+  STATEBOUND_OIDC_ISSUER: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.api.oidc.audience }}
+  STATEBOUND_OIDC_AUDIENCE: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.api.oidc.jwksURL }}
+  STATEBOUND_OIDC_JWKS_URL: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.api.devActor }}
+  STATEBOUND_DEV_ACTOR: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.telemetry.exporter }}
+  STATEBOUND_OTEL_EXPORTER: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.telemetry.endpoint }}
+  STATEBOUND_OTEL_ENDPOINT: {{ . | quote }}
+  {{- end }}
+  STATEBOUND_OTEL_INSECURE: {{ .Values.telemetry.insecure | quote }}
+  {{- with .Values.telemetry.serviceName }}
+  STATEBOUND_OTEL_SERVICE_NAME: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.telemetry.sampleRatio }}
+  STATEBOUND_OTEL_SAMPLE_RATIO: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.signing.keyId }}
+  STATEBOUND_SIGNING_KEY_ID: {{ . | quote }}
+  {{- end }}
+  {{- if .Values.signing.devSkip }}
+  STATEBOUND_DEV_SKIP_PLAN_SIGNATURE: "true"
+  {{- end }}
+  {{- if .Values.database.dsn }}
+  STATEBOUND_DB_DSN: {{ .Values.database.dsn | quote }}
+  {{- else }}
+  STATEBOUND_DB_HOST: {{ .Values.database.host | quote }}
+  STATEBOUND_DB_PORT: {{ .Values.database.port | quote }}
+  STATEBOUND_DB_NAME: {{ .Values.database.database | quote }}
+  STATEBOUND_DB_USER: {{ .Values.database.user | quote }}
+  STATEBOUND_DB_SSLMODE: {{ .Values.database.sslmode | quote }}
+  {{- end }}

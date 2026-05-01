@@ -25,7 +25,8 @@ GOOSE_RUN := docker run --rm \
   golang:1.25-alpine go run github.com/pressly/goose/v3/cmd/goose@$(GOOSE_VERSION)
 
 .PHONY: help dev test fmt lint migrate-up migrate-down run-api run-tui \
-        policy-test authz-sync-bundle docker-up docker-down build clean
+        policy-test authz-sync-bundle docker-up docker-down build clean \
+        docker-build docker-app-up docker-app-down
 
 help:
 	@echo "Statebound development targets:"
@@ -42,6 +43,9 @@ help:
 	@echo "  make docker-up     Start local Postgres in docker-compose"
 	@echo "  make docker-down   Stop and remove local Postgres"
 	@echo "  make build         Build ./bin/statebound"
+	@echo "  make docker-build  Build the statebound:dev container image (Dockerfile)"
+	@echo "  make docker-app-up Bring up Postgres + statebound API via docker-compose"
+	@echo "  make docker-app-down  Tear down the full app stack"
 	@echo "  make clean         Remove build outputs"
 
 # `dev` is the developer convenience target: bring the stack up. Add more
@@ -107,3 +111,28 @@ build: authz-sync-bundle
 
 clean:
 	rm -rf bin dist
+
+# docker-build builds the multi-stage Dockerfile at the repo root. The
+# resulting image carries the statebound binary baked with v1.0.0 metadata
+# and runs as the distroless `nonroot` user. Override IMAGE_TAG to push
+# under a different tag; override DOCKER_BUILD_ARGS to pass --no-cache or
+# additional --build-arg flags from the command line.
+IMAGE_TAG ?= statebound:dev
+DOCKER_BUILD_ARGS ?=
+docker-build:
+	docker build $(DOCKER_BUILD_ARGS) -t $(IMAGE_TAG) .
+
+# docker-app-up runs the full local stack: Postgres + the freshly-built
+# statebound API container, with goose migrations executed once via
+# `make migrate-up` against the same DSN compose exposes on the host.
+# This is the developer's "run the v1.0 demo end to end" target.
+docker-app-up:
+	$(COMPOSE) up -d --build
+	@echo "Waiting for Postgres to be healthy..."
+	@until $(COMPOSE) ps --status running postgres | grep -q postgres; do sleep 1; done
+	@echo "Running migrations against $(STATEBOUND_DB_DSN)..."
+	$(MAKE) migrate-up
+	@echo "Stack up. API: http://localhost:8080  Postgres: localhost:5432"
+
+docker-app-down:
+	$(COMPOSE) down

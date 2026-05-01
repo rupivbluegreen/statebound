@@ -1,0 +1,73 @@
+{{- if .Values.migrations.enabled }}
+{{/*
+One-shot Job that runs goose migrations against the configured
+database before the main Deployment rolls out. The Job is annotated
+as a Helm pre-install / pre-upgrade hook so it runs first; the
+hook-weight pulls it ahead of any other hook the operator wires in.
+
+NOTE on migration source: in v0.1 of the chart the operator is
+expected to pre-populate /migrations inside their goose image (or use
+a sidecar that mounts a ConfigMap). The chart documents this gap in
+deploy/helm/statebound/README.md and the goose binary is invoked with
+"-dir /migrations" — so any image that places the migrations there
+works. Future chart versions will publish a dedicated
+statebound-migrations image bundled with the canonical migrations.
+*/}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "statebound.fullname" . }}-migrate
+  labels:
+    {{- include "statebound.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "{{ .Values.migrations.hookWeight }}"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels:
+        {{- include "statebound.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: migrations
+    spec:
+      serviceAccountName: {{ include "statebound.serviceAccountName" . }}
+      restartPolicy: Never
+      securityContext:
+        {{- toYaml .Values.securityContext | nindent 8 }}
+      containers:
+        - name: goose
+          image: "{{ .Values.migrations.image.repository }}:{{ .Values.migrations.image.tag }}"
+          imagePullPolicy: {{ .Values.migrations.image.pullPolicy }}
+          command: ["sh", "-c"]
+          args:
+            - |
+              set -eu
+              if [ -n "${STATEBOUND_DB_DSN:-}" ]; then
+                DSN="${STATEBOUND_DB_DSN}"
+              else
+                DSN="postgres://${STATEBOUND_DB_USER}:${STATEBOUND_DB_PASSWORD}@${STATEBOUND_DB_HOST}:${STATEBOUND_DB_PORT}/${STATEBOUND_DB_NAME}?sslmode=${STATEBOUND_DB_SSLMODE}"
+              fi
+              exec goose -dir /migrations postgres "$DSN" up
+          envFrom:
+            - configMapRef:
+                name: {{ include "statebound.fullname" . }}-config
+          env:
+            {{- if and (not .Values.database.dsn) .Values.database.passwordSecretRef.name }}
+            - name: STATEBOUND_DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.database.passwordSecretRef.name }}
+                  key: {{ .Values.database.passwordSecretRef.key }}
+            {{- end }}
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "200m"
+              memory: "128Mi"
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+{{- end }}
