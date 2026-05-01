@@ -129,16 +129,23 @@ jobs:
           ./bin/statebound audit verify
 
           # Phase 4': drift detection
-          # Build a faked actual-state directory from a plan output
+          # Build a faked actual-state directory from a plan output. Each
+          # fragment's content carries embedded newlines, so we use
+          # python rather than a bash read loop (which would split on
+          # newlines and lose filenames).
           mkdir -p /tmp/sudoers.d
-          # Extract the linux.sudoers-fragment content from a plan file
-          # (using jq or python). For Phase 4' smoke, we simulate "no
-          # drift" by writing the desired content as the actual state.
-          jq -r '.items[] | select(.resource_kind=="linux.sudoers-fragment") | .body | "\(.path)\t\(.content)"' /tmp/plan-sudo-1.json > /tmp/fragments.tsv
-          while IFS=$'\t' read -r path content; do
-            fname=$(basename "$path")
-            echo -e "$content" > "/tmp/sudoers.d/$fname"
-          done < /tmp/fragments.tsv
+          python3 - <<'PY'
+          import json, os
+          plan = json.load(open('/tmp/plan-sudo-1.json'))
+          os.makedirs('/tmp/sudoers.d', exist_ok=True)
+          for it in plan['items']:
+              if it['resource_kind'] != 'linux.sudoers-fragment':
+                  continue
+              fname = os.path.basename(it['body']['path'])
+              with open('/tmp/sudoers.d/' + fname, 'w') as f:
+                  f.write(it['body']['content'])
+          PY
+          ls -la /tmp/sudoers.d/
 
           ./bin/statebound drift scan --product payments-api --connector linux-sudo --source /tmp/sudoers.d --output /tmp/drift-1.json
           ./bin/statebound drift scan --product payments-api --connector linux-sudo --source /tmp/sudoers.d --output /tmp/drift-2.json
