@@ -1,8 +1,10 @@
 # Statebound
 
-> **Status: pre-release, Phase 0.** The product name "Statebound" is the
+[![CI](https://github.com/rupivbluegreen/statebound/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/rupivbluegreen/statebound/actions/workflows/ci.yml)
+
+> **Status: pre-release, Phase 1.** The product name "Statebound" is the
 > working name and is pending trademark clearance — do not use in
-> public-facing artifacts (per `the project spec` rename changelog).
+> public-facing artifacts (per the rename changelog in the project spec).
 
 ## What is Statebound
 
