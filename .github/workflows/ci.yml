@@ -108,5 +108,14 @@ jobs:
           ./bin/statebound policy --help
           ./bin/statebound policy test --help
 
+          # Phase 3: evidence engine reproducibility
+          ./bin/statebound evidence export --product payments-api --format json --output /tmp/ev1.json
+          ./bin/statebound evidence export --product payments-api --format json --output /tmp/ev2.json
+          # Same inputs → byte-identical bytes
+          diff -q /tmp/ev1.json /tmp/ev2.json
+          ./bin/statebound evidence list --product payments-api
+          ./bin/statebound evidence export --product payments-api --format markdown --output /tmp/ev1.md
+          test -s /tmp/ev1.md
+
           # Standalone product create still works
           ./bin/statebound product create checkout-api --owner ci-bot --description "CI smoke product"

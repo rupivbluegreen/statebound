@@ -2060,6 +2060,213 @@ func scanPolicyDecision(r scannable) (*storage.PolicyDecisionRecord, error) {
 	return rec, nil
 }
 
+// -------- Evidence packs --------
+
+const evidencePackColumns = "id, product_id, approved_version_id, sequence, format, " +
+	"content_hash, content, generated_at, generated_by_kind, generated_by_subject"
+
+// validEvidencePackFormats mirrors the CHECK constraint in
+// migrations/0005_evidence_packs.sql. Validating in Go gives callers a clean
+// ErrInvalidArgument up front instead of a Postgres CHECK violation.
+var validEvidencePackFormats = map[string]struct{}{
+	"json":     {},
+	"markdown": {},
+}
+
+// AppendEvidencePack inserts a single evidence pack row. The Content field is
+// bound as JSONB. INSERT ... ON CONFLICT (approved_version_id, format,
+// content_hash) DO NOTHING makes deterministic re-exports a no-op: callers
+// that want to detect re-use can follow up with a Get.
+//
+// FK violations on product_id / approved_version_id surface as ErrNotFound so
+// callers can distinguish a stale reference from a transient failure.
+func (s *Store) AppendEvidencePack(ctx context.Context, pack *domain.EvidencePack) error {
+	if pack == nil {
+		return storage.ErrInvalidArgument
+	}
+	if pack.ID == "" {
+		return fmt.Errorf("%w: evidence pack id", storage.ErrInvalidArgument)
+	}
+	if pack.ProductID == "" {
+		return fmt.Errorf("%w: evidence pack product id", storage.ErrInvalidArgument)
+	}
+	if pack.ApprovedVersionID == "" {
+		return fmt.Errorf("%w: evidence pack approved version id", storage.ErrInvalidArgument)
+	}
+	if pack.Sequence < 1 {
+		return fmt.Errorf("%w: evidence pack sequence", storage.ErrInvalidArgument)
+	}
+	if _, ok := validEvidencePackFormats[pack.Format]; !ok {
+		return fmt.Errorf("%w: evidence pack format %q", storage.ErrInvalidArgument, pack.Format)
+	}
+	if pack.ContentHash == "" {
+		return fmt.Errorf("%w: evidence pack content hash", storage.ErrInvalidArgument)
+	}
+	if len(pack.Content) == 0 {
+		return fmt.Errorf("%w: evidence pack content", storage.ErrInvalidArgument)
+	}
+	if err := pack.GeneratedBy.Validate(); err != nil {
+		return fmt.Errorf("%w: %v", storage.ErrInvalidArgument, err)
+	}
+	if pack.GeneratedAt.IsZero() {
+		pack.GeneratedAt = time.Now().UTC()
+	}
+
+	const q = `
+INSERT INTO evidence_packs (
+  id, product_id, approved_version_id, sequence, format,
+  content_hash, content, generated_at, generated_by_kind, generated_by_subject
+) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10)
+ON CONFLICT (approved_version_id, format, content_hash) DO NOTHING
+`
+	_, err := s.q.Exec(ctx, q,
+		string(pack.ID),
+		string(pack.ProductID),
+		string(pack.ApprovedVersionID),
+		pack.Sequence,
+		pack.Format,
+		pack.ContentHash,
+		[]byte(pack.Content),
+		pack.GeneratedAt,
+		string(pack.GeneratedBy.Kind),
+		pack.GeneratedBy.Subject,
+	)
+	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) {
+			switch pgErr.Code {
+			case pgForeignKeyViolation:
+				return fmt.Errorf("%w: %s", storage.ErrNotFound, pgErr.ConstraintName)
+			case pgCheckViolation:
+				return fmt.Errorf("%w: %s", storage.ErrInvalidArgument, pgErr.ConstraintName)
+			}
+		}
+		return fmt.Errorf("postgres: insert evidence_pack: %w", err)
+	}
+	return nil
+}
+
+// GetEvidencePackByID returns the pack identified by id, or
+// ErrEvidencePackNotFound if absent.
+func (s *Store) GetEvidencePackByID(ctx context.Context, id domain.ID) (*domain.EvidencePack, error) {
+	if id == "" {
+		return nil, storage.ErrInvalidArgument
+	}
+	const q = `SELECT ` + evidencePackColumns + ` FROM evidence_packs WHERE id = $1`
+	pack, err := scanEvidencePack(s.q.QueryRow(ctx, q, string(id)))
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			return nil, storage.ErrEvidencePackNotFound
+		}
+		return nil, err
+	}
+	return pack, nil
+}
+
+// ListEvidencePacksByProduct returns packs for productID newest first.
+// limit <= 0 means no limit. An empty slice (not an error) is returned when
+// the product has no packs.
+func (s *Store) ListEvidencePacksByProduct(ctx context.Context, productID domain.ID, limit int) ([]*domain.EvidencePack, error) {
+	if productID == "" {
+		return nil, storage.ErrInvalidArgument
+	}
+	q := `
+SELECT ` + evidencePackColumns + `
+  FROM evidence_packs
+ WHERE product_id = $1
+ ORDER BY generated_at DESC, id DESC
+`
+	args := []any{string(productID)}
+	if limit > 0 {
+		args = append(args, limit)
+		q += " LIMIT $2"
+	}
+	rows, err := s.q.Query(ctx, q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: list evidence_packs: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]*domain.EvidencePack, 0)
+	for rows.Next() {
+		pack, err := scanEvidencePack(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, pack)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("postgres: iterate evidence_packs: %w", err)
+	}
+	return out, nil
+}
+
+// GetEvidencePackByVersionFormat returns the most recently generated pack for
+// (approved_version_id, format), or ErrEvidencePackNotFound if no row matches.
+// Several rows can share the same (av, format) when the engine produces
+// distinct content hashes over time; we return the newest by generated_at.
+func (s *Store) GetEvidencePackByVersionFormat(ctx context.Context, approvedVersionID domain.ID, format string) (*domain.EvidencePack, error) {
+	if approvedVersionID == "" {
+		return nil, storage.ErrInvalidArgument
+	}
+	if _, ok := validEvidencePackFormats[format]; !ok {
+		return nil, fmt.Errorf("%w: evidence pack format %q", storage.ErrInvalidArgument, format)
+	}
+	const q = `
+SELECT ` + evidencePackColumns + `
+  FROM evidence_packs
+ WHERE approved_version_id = $1 AND format = $2
+ ORDER BY generated_at DESC
+ LIMIT 1
+`
+	pack, err := scanEvidencePack(s.q.QueryRow(ctx, q, string(approvedVersionID), format))
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			return nil, storage.ErrEvidencePackNotFound
+		}
+		return nil, err
+	}
+	return pack, nil
+}
+
+func scanEvidencePack(r scannable) (*domain.EvidencePack, error) {
+	var (
+		id, productID, approvedVersionID         string
+		sequence                                 int64
+		format, contentHash                      string
+		contentRaw                               []byte
+		generatedAt                              time.Time
+		generatedByKind, generatedBySubject      string
+	)
+	err := r.Scan(
+		&id, &productID, &approvedVersionID, &sequence, &format,
+		&contentHash, &contentRaw, &generatedAt, &generatedByKind, &generatedBySubject,
+	)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, storage.ErrNotFound
+		}
+		return nil, fmt.Errorf("postgres: scan evidence_pack: %w", err)
+	}
+	pack := &domain.EvidencePack{
+		ID:                domain.ID(id),
+		ProductID:         domain.ID(productID),
+		ApprovedVersionID: domain.ID(approvedVersionID),
+		Sequence:          sequence,
+		Format:            format,
+		ContentHash:       contentHash,
+		GeneratedAt:       generatedAt,
+		GeneratedBy: domain.Actor{
+			Kind:    domain.ActorKind(generatedByKind),
+			Subject: generatedBySubject,
+		},
+	}
+	if len(contentRaw) > 0 {
+		pack.Content = json.RawMessage(append([]byte(nil), contentRaw...))
+	}
+	return pack, nil
+}
+
 // canonicalUUID parses s as a UUID and re-formats it in the canonical 36-char
 // hyphenated lowercase form expected by Postgres uuid columns. Returns an
 // error if s is not a valid UUID.

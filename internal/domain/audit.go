@@ -29,6 +29,8 @@ const (
 	EventEntitlementCreated     EventKind = "entitlement.created"
 	EventEntitlementDeleted     EventKind = "entitlement.deleted"
 	EventEntitlementUpdated     EventKind = "entitlement.updated"
+	EventEvidenceCreated        EventKind = "evidence.created"
+	EventEvidenceExported       EventKind = "evidence.exported"
 	EventGlobalObjectCreated    EventKind = "global_object.created"
 	EventGlobalObjectDeleted    EventKind = "global_object.deleted"
 	EventGlobalObjectUpdated    EventKind = "global_object.updated"

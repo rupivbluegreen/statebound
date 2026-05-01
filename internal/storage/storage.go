@@ -21,6 +21,8 @@ var (
 	ErrChangeSetNotFound = errors.New("storage: change set not found")
 	// ErrPolicyDecisionNotFound is returned when a policy_decisions lookup misses.
 	ErrPolicyDecisionNotFound = errors.New("storage: policy decision not found")
+	// ErrEvidencePackNotFound is returned when an evidence_packs lookup misses.
+	ErrEvidencePackNotFound = errors.New("storage: evidence pack not found")
 )
 
 // AuditFilter narrows ListAuditEvents results. A zero Limit means no limit.
@@ -179,6 +181,30 @@ type PolicyDecisionStore interface {
 	GetPolicyDecisionByID(ctx context.Context, id domain.ID) (*PolicyDecisionRecord, error)
 }
 
+// EvidencePackStore persists immutable evidence packs exported per
+// ApprovedVersion. Re-exporting deterministic content for the same
+// (approved_version, format, content_hash) is a no-op via ON CONFLICT —
+// AppendEvidencePack returns nil and the existing row stands.
+type EvidencePackStore interface {
+	// AppendEvidencePack inserts a pack row. ON CONFLICT
+	// (approved_version_id, format, content_hash) DO NOTHING, so a re-export
+	// of byte-identical content returns nil and leaves the existing row.
+	// If the FK to products or approved_versions is violated, returns
+	// ErrNotFound.
+	AppendEvidencePack(ctx context.Context, pack *domain.EvidencePack) error
+	// GetEvidencePackByID returns a single pack by id, or
+	// ErrEvidencePackNotFound if absent.
+	GetEvidencePackByID(ctx context.Context, id domain.ID) (*domain.EvidencePack, error)
+	// ListEvidencePacksByProduct returns packs for productID, newest first.
+	// limit <= 0 means no limit. An empty slice is returned (not an error)
+	// when there are no rows.
+	ListEvidencePacksByProduct(ctx context.Context, productID domain.ID, limit int) ([]*domain.EvidencePack, error)
+	// GetEvidencePackByVersionFormat returns the most recently generated pack
+	// for the given (approved_version_id, format) pair, or
+	// ErrEvidencePackNotFound if no row matches.
+	GetEvidencePackByVersionFormat(ctx context.Context, approvedVersionID domain.ID, format string) (*domain.EvidencePack, error)
+}
+
 // Storage is the aggregate persistence boundary used by the application layer.
 type Storage interface {
 	ProductStore
@@ -193,6 +219,7 @@ type Storage interface {
 	ApprovalStore
 	ApprovedVersionStore
 	PolicyDecisionStore
+	EvidencePackStore
 	Close(ctx context.Context) error
 	Ping(ctx context.Context) error
 	// WithTx runs fn inside a database transaction. The Storage handed to fn issues
