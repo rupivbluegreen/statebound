@@ -12,6 +12,7 @@ import (
 	"github.com/spf13/cobra"
 	"gopkg.in/yaml.v3"
 
+	"statebound.dev/statebound/internal/authz"
 	"statebound.dev/statebound/internal/domain"
 	"statebound.dev/statebound/internal/model"
 	"statebound.dev/statebound/internal/storage"
@@ -120,6 +121,17 @@ func newModelImportCmd() *cobra.Command {
 // the approval queue without a second CLI invocation.
 func submitChangeSet(ctx context.Context, store storage.Storage, w io.Writer, csID domain.ID, actor domain.Actor) error {
 	if err := store.WithTx(ctx, func(tx storage.Storage) error {
+		cs, err := tx.GetChangeSetByID(ctx, csID)
+		if err != nil {
+			return fmt.Errorf("get change set: %w", err)
+		}
+		result, err := evaluatePolicyGate(ctx, tx, authz.PhaseSubmit, cs, actor)
+		if err != nil {
+			return err
+		}
+		if err := enforcePolicy(result); err != nil {
+			return err
+		}
 		now := time.Now().UTC()
 		if err := tx.UpdateChangeSetState(ctx, csID, domain.ChangeSetStateSubmitted, &now, ""); err != nil {
 			return fmt.Errorf("transition to submitted: %w", err)

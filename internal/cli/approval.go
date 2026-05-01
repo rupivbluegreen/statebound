@@ -13,6 +13,7 @@ import (
 	"github.com/spf13/cobra"
 	"gopkg.in/yaml.v3"
 
+	"statebound.dev/statebound/internal/authz"
 	"statebound.dev/statebound/internal/domain"
 	"statebound.dev/statebound/internal/model"
 	"statebound.dev/statebound/internal/storage"
@@ -442,6 +443,14 @@ func runApprove(ctx context.Context, store storage.Storage, w io.Writer, csID do
 		}
 		if cur.State != domain.ChangeSetStateSubmitted {
 			return fmt.Errorf("change set %s is %s, not submitted", shortID(csID), cur.State)
+		}
+
+		result, err := evaluatePolicyGate(ctx, tx, authz.PhaseApprove, cur, actor)
+		if err != nil {
+			return err
+		}
+		if err := enforcePolicy(result); err != nil {
+			return err
 		}
 
 		// Materialize the new approved-version content from the parent

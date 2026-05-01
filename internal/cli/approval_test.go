@@ -8,15 +8,33 @@ import (
 	"testing"
 	"time"
 
+	"statebound.dev/statebound/internal/authz"
 	"statebound.dev/statebound/internal/domain"
 	"statebound.dev/statebound/internal/storage"
 )
+
+// stubPolicyGate replaces the package-level evaluatePolicyGate hook for the
+// duration of a test. The four-eyes tests exercise runApprove's state-machine
+// surface; the OPA gate is covered separately in internal/authz.
+func stubPolicyGate(t *testing.T) {
+	t.Helper()
+	prev := evaluatePolicyGate
+	evaluatePolicyGate = func(_ context.Context, _ storage.Storage, phase authz.EvalPhase, cs *domain.ChangeSet, _ domain.Actor) (*authz.PolicyResult, error) {
+		return &authz.PolicyResult{
+			ChangeSetID: cs.ID,
+			Phase:       phase,
+			Outcome:     authz.DecisionAllow,
+		}, nil
+	}
+	t.Cleanup(func() { evaluatePolicyGate = prev })
+}
 
 // TestApproval_FourEyes_RequesterCannotApproveOwn verifies the four-eyes rule:
 // the actor that requested a ChangeSet must not be allowed to approve it. The
 // handler returns an error before any storage call beyond the initial reads,
 // which is exactly what the fake stub records and the assertions check.
 func TestApproval_FourEyes_RequesterCannotApproveOwn(t *testing.T) {
+	stubPolicyGate(t)
 	requester := domain.Actor{Kind: domain.ActorHuman, Subject: "alice@example.com"}
 	productID := domain.ID("00000000-0000-0000-0000-00000000aaaa")
 	csID := domain.ID("00000000-0000-0000-0000-00000000cccc")
@@ -59,6 +77,7 @@ func TestApproval_FourEyes_RequesterCannotApproveOwn(t *testing.T) {
 // the tx so we exit fast — what matters is that we got past the four-eyes
 // gate.
 func TestApproval_FourEyes_DifferentApproverPasses(t *testing.T) {
+	stubPolicyGate(t)
 	requester := domain.Actor{Kind: domain.ActorHuman, Subject: "alice@example.com"}
 	approver := domain.Actor{Kind: domain.ActorHuman, Subject: "bob@example.com"}
 	productID := domain.ID("00000000-0000-0000-0000-00000000aaaa")

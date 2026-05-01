@@ -27,13 +27,13 @@ const (
 
 // Sentinel errors for ChangeSet validation and state machine.
 var (
-	ErrChangeSetTitleRequired       = errors.New("domain: change set title is required")
-	ErrChangeSetTitleTooLong        = errors.New("domain: change set title exceeds 255 characters")
-	ErrChangeSetDescriptionTooLong  = errors.New("domain: change set description exceeds 4096 characters")
-	ErrChangeSetProductIDRequired   = errors.New("domain: change set product id is required")
-	ErrChangeSetStateInvalid        = errors.New("domain: change set state is invalid")
-	ErrChangeSetInvalidTransition   = errors.New("domain: change set state transition is not allowed")
-	ErrChangeSetReasonTooLong       = errors.New("domain: change set decision reason exceeds 4096 characters")
+	ErrChangeSetTitleRequired      = errors.New("domain: change set title is required")
+	ErrChangeSetTitleTooLong       = errors.New("domain: change set title exceeds 255 characters")
+	ErrChangeSetDescriptionTooLong = errors.New("domain: change set description exceeds 4096 characters")
+	ErrChangeSetProductIDRequired  = errors.New("domain: change set product id is required")
+	ErrChangeSetStateInvalid       = errors.New("domain: change set state is invalid")
+	ErrChangeSetInvalidTransition  = errors.New("domain: change set state transition is not allowed")
+	ErrChangeSetReasonTooLong      = errors.New("domain: change set decision reason exceeds 4096 characters")
 )
 
 // ChangeSet is a draft set of changes awaiting review and approval.

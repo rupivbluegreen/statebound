@@ -25,7 +25,7 @@ GOOSE_RUN := docker run --rm \
   golang:1.25-alpine go run github.com/pressly/goose/v3/cmd/goose@$(GOOSE_VERSION)
 
 .PHONY: help dev test fmt lint migrate-up migrate-down run-api run-tui \
-        policy-test docker-up docker-down build clean
+        policy-test authz-sync-bundle docker-up docker-down build clean
 
 help:
 	@echo "Statebound development targets:"
@@ -79,11 +79,19 @@ run-api:
 run-tui:
 	$(GO) run ./cmd/statebound tui
 
-# Phase 0 stub. Real Rego rules and tests are introduced in Phase 2;
-# see the project spec §15.
-policy-test:
-	@echo "policy-test: no Rego rules to test until Phase 2"
-	@exit 0
+# Runs the OPA tester library against `policies/builtin` (rules) and
+# `policies/tests` (test files). The runner lives under `tools/opa-test/`
+# so we don't drag the CLI's init wiring or DB connection into a Rego
+# unit test loop. STATEBOUND_REGO_BUNDLE/TESTS env vars override the paths.
+policy-test: authz-sync-bundle
+	$(GO) run ./tools/opa-test
+
+# authz-sync-bundle copies the authoritative Rego rule files from
+# policies/builtin/ into internal/authz/bundle/, where Go's //go:embed
+# directive picks them up. Embed forbids parent-relative paths, so we
+# duplicate at build time. The bundle/ files are gitignored.
+authz-sync-bundle:
+	@cp policies/builtin/*.rego internal/authz/bundle/
 
 docker-up:
 	$(COMPOSE) up -d
@@ -94,7 +102,7 @@ docker-down:
 # scripts/go.sh mounts the repo at /work inside the container, so the
 # binary written to /work/bin/statebound shows up on the host as
 # ./bin/statebound.
-build:
+build: authz-sync-bundle
 	$(GO) build -o /work/bin/statebound ./cmd/statebound
 
 clean:

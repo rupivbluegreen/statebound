@@ -2,8 +2,9 @@
 
 [![CI](https://github.com/rupivbluegreen/statebound/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/rupivbluegreen/statebound/actions/workflows/ci.yml)
 
-> **Status: pre-release, Phase 2 wave A** (ChangeSets, four-eyes
-> approval, immutable approved versions, hash-chained audit log). The
+> **Status: pre-release, Phase 2 wave B** (ChangeSets, four-eyes
+> approval, immutable approved versions, hash-chained audit log, OPA +
+> Rego built-in rule library, decision-log fanout, `policy` CLI). The
 > product name "Statebound" is the working name and is pending trademark
 > clearance — do not use in public-facing artifacts (per the rename
 > changelog in the project spec).

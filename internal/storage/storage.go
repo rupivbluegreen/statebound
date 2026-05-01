@@ -3,6 +3,7 @@ package storage
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"time"
 
@@ -15,6 +16,11 @@ var (
 	ErrAlreadyExists   = errors.New("storage: already exists")
 	ErrConflict        = errors.New("storage: conflict")
 	ErrInvalidArgument = errors.New("storage: invalid argument")
+	// ErrChangeSetNotFound is returned when a write references a change_set_id
+	// that does not exist; e.g. AppendPolicyDecision against a stale id.
+	ErrChangeSetNotFound = errors.New("storage: change set not found")
+	// ErrPolicyDecisionNotFound is returned when a policy_decisions lookup misses.
+	ErrPolicyDecisionNotFound = errors.New("storage: policy decision not found")
 )
 
 // AuditFilter narrows ListAuditEvents results. A zero Limit means no limit.
@@ -143,6 +149,36 @@ type ApprovedVersionStore interface {
 	NextSequenceForProduct(ctx context.Context, productID domain.ID) (int64, error)
 }
 
+// PolicyDecisionRecord is a single OPA evaluation against a ChangeSet,
+// preserved for audit and replay. The Rules and Input fields hold the
+// canonical JSON produced by internal/authz so the decision can be
+// reproduced byte-for-byte given the same bundle hash.
+type PolicyDecisionRecord struct {
+	ID          domain.ID
+	ChangeSetID domain.ID
+	Phase       string
+	Outcome     string
+	Rules       json.RawMessage
+	Input       json.RawMessage
+	BundleHash  string
+	EvaluatedAt time.Time
+	CreatedAt   time.Time
+}
+
+// PolicyDecisionStore persists OPA decision records produced when a ChangeSet
+// is evaluated. Decisions are append-only; there is no Update or Delete API.
+type PolicyDecisionStore interface {
+	// AppendPolicyDecision inserts a decision row. If rec.ChangeSetID does not
+	// reference an existing change_sets row, returns ErrChangeSetNotFound.
+	AppendPolicyDecision(ctx context.Context, rec *PolicyDecisionRecord) error
+	// ListPolicyDecisionsByChangeSet returns decisions for csID newest first,
+	// or an empty slice if there are none.
+	ListPolicyDecisionsByChangeSet(ctx context.Context, csID domain.ID) ([]*PolicyDecisionRecord, error)
+	// GetPolicyDecisionByID returns a single decision by id, or
+	// ErrPolicyDecisionNotFound if absent.
+	GetPolicyDecisionByID(ctx context.Context, id domain.ID) (*PolicyDecisionRecord, error)
+}
+
 // Storage is the aggregate persistence boundary used by the application layer.
 type Storage interface {
 	ProductStore
@@ -156,6 +192,7 @@ type Storage interface {
 	ChangeSetStore
 	ApprovalStore
 	ApprovedVersionStore
+	PolicyDecisionStore
 	Close(ctx context.Context) error
 	Ping(ctx context.Context) error
 	// WithTx runs fn inside a database transaction. The Storage handed to fn issues

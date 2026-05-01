@@ -76,6 +76,7 @@ func init() {
 	addApprovalCmd(rootCmd)
 	addDiffCmd(rootCmd)
 	addAuditCmd(rootCmd)
+	addPolicyCmd(rootCmd)
 	addAgentCmd(rootCmd)
 	addInferenceCmd(rootCmd)
 }

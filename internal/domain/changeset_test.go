@@ -14,10 +14,10 @@ func validRequester(t *testing.T) Actor {
 
 func TestNewChangeSet_Valid(t *testing.T) {
 	cases := []struct {
-		name    string
-		title   string
-		descr   string
-		parent  *ID
+		name   string
+		title  string
+		descr  string
+		parent *ID
 	}{
 		{"first changeset, no parent", "Initial model", "Bootstrap product authorization", nil},
 		{"with parent version", "Add prod-readonly", "", func() *ID { id := NewID(); return &id }()},

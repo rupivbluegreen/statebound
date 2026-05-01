@@ -18,10 +18,10 @@ func TestNewApprovedVersion_Valid(t *testing.T) {
 	csID := NewID()
 	parent := NewID()
 	cases := []struct {
-		name     string
-		seq      int64
-		parent   *ID
-		descr    string
+		name   string
+		seq    int64
+		parent *ID
+		descr  string
 	}{
 		{"first version", 1, nil, "Initial approved model"},
 		{"sequence 2 with parent", 2, &parent, ""},

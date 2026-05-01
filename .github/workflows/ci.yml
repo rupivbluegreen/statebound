@@ -47,14 +47,22 @@ jobs:
             exit 1
           fi
 
+      - name: Sync Rego bundle into authz embed
+        run: cp policies/builtin/*.rego internal/authz/bundle/
+
       - name: Vet
         run: go vet ./...
 
       - name: Build
-        run: go build -o bin/statebound ./cmd/statebound
+        run: |
+          go build -o bin/statebound ./cmd/statebound
+          go build -o bin/opa-test ./tools/opa-test
 
       - name: Test
         run: go test ./... -count=1 -race
+
+      - name: Rego unit tests
+        run: go run ./tools/opa-test
 
       - name: Install goose
         run: |
@@ -93,8 +101,12 @@ jobs:
           diff_out=$(./bin/statebound diff --product payments-api -f examples/payments-api/model.yaml)
           echo "$diff_out" | grep -q "no changes"
 
-          # Audit chain integrity
+          # Audit chain integrity (now includes policy.evaluated events)
           ./bin/statebound audit verify
+
+          # Phase 2 wave B: policy CLI is wired
+          ./bin/statebound policy --help
+          ./bin/statebound policy test --help
 
           # Standalone product create still works
           ./bin/statebound product create checkout-api --owner ci-bot --description "CI smoke product"

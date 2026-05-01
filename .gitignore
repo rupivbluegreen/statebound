@@ -32,6 +32,11 @@ schemas/openapi.gen.go
 schemas/*.gen.go
 internal/storage/sqlc/
 
+# Rego bundle is synced from policies/builtin/ at build time. The
+# authoritative copies live in policies/builtin/; the embed copy is a
+# build artifact (see Makefile authz-sync-bundle and the CI workflow).
+internal/authz/bundle/*.rego
+
 # Local-only project state.
 /.claude/
 /.remember/

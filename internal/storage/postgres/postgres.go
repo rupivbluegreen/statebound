@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -1895,6 +1896,189 @@ func scanApprovedVersionSnapshot(r scannable) (*domain.ApprovedVersionSnapshot, 
 		}
 	}
 	return snap, nil
+}
+
+// -------- Policy decisions --------
+
+const policyDecisionColumns = "id, change_set_id, phase, outcome, rules, input, bundle_hash, evaluated_at, created_at"
+
+// validPolicyPhases / validPolicyOutcomes mirror the CHECK constraints in
+// migrations/0004_policy_decisions.sql. Validating in Go gives callers a clean
+// ErrInvalidArgument up front instead of a Postgres CHECK violation.
+var (
+	validPolicyPhases   = map[string]struct{}{"submit": {}, "approve": {}}
+	validPolicyOutcomes = map[string]struct{}{"allow": {}, "deny": {}, "escalate_required": {}}
+)
+
+// AppendPolicyDecision inserts a single OPA decision row. The Rules and Input
+// fields are bound as JSONB. A change_set_id that does not reference an
+// existing change_sets row produces ErrChangeSetNotFound. The CreatedAt field
+// is populated by the database default and read back via RETURNING.
+func (s *Store) AppendPolicyDecision(ctx context.Context, rec *storage.PolicyDecisionRecord) error {
+	if rec == nil {
+		return storage.ErrInvalidArgument
+	}
+	if rec.ID == "" || rec.ChangeSetID == "" {
+		return storage.ErrInvalidArgument
+	}
+	idStr, err := canonicalUUID(string(rec.ID))
+	if err != nil {
+		return fmt.Errorf("%w: policy decision id: %v", storage.ErrInvalidArgument, err)
+	}
+	csIDStr, err := canonicalUUID(string(rec.ChangeSetID))
+	if err != nil {
+		return fmt.Errorf("%w: change set id: %v", storage.ErrInvalidArgument, err)
+	}
+	if _, ok := validPolicyPhases[rec.Phase]; !ok {
+		return fmt.Errorf("%w: policy decision phase %q", storage.ErrInvalidArgument, rec.Phase)
+	}
+	if _, ok := validPolicyOutcomes[rec.Outcome]; !ok {
+		return fmt.Errorf("%w: policy decision outcome %q", storage.ErrInvalidArgument, rec.Outcome)
+	}
+	if rec.BundleHash == "" {
+		return fmt.Errorf("%w: policy decision bundle hash", storage.ErrInvalidArgument)
+	}
+
+	rules := jsonOrNullObject(rec.Rules)
+	input := jsonOrNullObject(rec.Input)
+
+	if rec.EvaluatedAt.IsZero() {
+		rec.EvaluatedAt = time.Now().UTC()
+	}
+
+	const q = `
+INSERT INTO policy_decisions (
+  id, change_set_id, phase, outcome, rules, input, bundle_hash, evaluated_at
+) VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb, $7, $8)
+RETURNING created_at
+`
+	row := s.q.QueryRow(ctx, q,
+		idStr,
+		csIDStr,
+		rec.Phase,
+		rec.Outcome,
+		rules,
+		input,
+		rec.BundleHash,
+		rec.EvaluatedAt,
+	)
+	if err := row.Scan(&rec.CreatedAt); err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) {
+			switch pgErr.Code {
+			case pgForeignKeyViolation:
+				return fmt.Errorf("%w: %s", storage.ErrChangeSetNotFound, pgErr.ConstraintName)
+			case pgUniqueViolation:
+				return storage.ErrAlreadyExists
+			}
+		}
+		return fmt.Errorf("postgres: insert policy_decision: %w", err)
+	}
+	// Echo the canonical ids back so the caller's record matches what is on disk.
+	rec.ID = domain.ID(idStr)
+	rec.ChangeSetID = domain.ID(csIDStr)
+	return nil
+}
+
+// ListPolicyDecisionsByChangeSet returns every decision for csID, newest first.
+// An empty slice is returned (not an error) when there are no rows.
+func (s *Store) ListPolicyDecisionsByChangeSet(ctx context.Context, csID domain.ID) ([]*storage.PolicyDecisionRecord, error) {
+	if csID == "" {
+		return nil, storage.ErrInvalidArgument
+	}
+	const q = `
+SELECT ` + policyDecisionColumns + `
+  FROM policy_decisions
+ WHERE change_set_id = $1
+ ORDER BY evaluated_at DESC, id DESC
+`
+	rows, err := s.q.Query(ctx, q, string(csID))
+	if err != nil {
+		return nil, fmt.Errorf("postgres: list policy_decisions: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]*storage.PolicyDecisionRecord, 0)
+	for rows.Next() {
+		rec, err := scanPolicyDecision(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, rec)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("postgres: iterate policy_decisions: %w", err)
+	}
+	return out, nil
+}
+
+// GetPolicyDecisionByID returns the decision identified by id, or
+// ErrPolicyDecisionNotFound if no row matches.
+func (s *Store) GetPolicyDecisionByID(ctx context.Context, id domain.ID) (*storage.PolicyDecisionRecord, error) {
+	if id == "" {
+		return nil, storage.ErrInvalidArgument
+	}
+	const q = `SELECT ` + policyDecisionColumns + ` FROM policy_decisions WHERE id = $1`
+	rec, err := scanPolicyDecision(s.q.QueryRow(ctx, q, string(id)))
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			return nil, storage.ErrPolicyDecisionNotFound
+		}
+		return nil, err
+	}
+	return rec, nil
+}
+
+func scanPolicyDecision(r scannable) (*storage.PolicyDecisionRecord, error) {
+	var (
+		id, csID, phase, outcome, bundleHash string
+		rulesRaw, inputRaw                   []byte
+		evaluatedAt, createdAt               time.Time
+	)
+	err := r.Scan(&id, &csID, &phase, &outcome, &rulesRaw, &inputRaw, &bundleHash, &evaluatedAt, &createdAt)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, storage.ErrNotFound
+		}
+		return nil, fmt.Errorf("postgres: scan policy_decision: %w", err)
+	}
+	rec := &storage.PolicyDecisionRecord{
+		ID:          domain.ID(id),
+		ChangeSetID: domain.ID(csID),
+		Phase:       phase,
+		Outcome:     outcome,
+		BundleHash:  bundleHash,
+		EvaluatedAt: evaluatedAt,
+		CreatedAt:   createdAt,
+	}
+	if len(rulesRaw) > 0 {
+		rec.Rules = json.RawMessage(append([]byte(nil), rulesRaw...))
+	}
+	if len(inputRaw) > 0 {
+		rec.Input = json.RawMessage(append([]byte(nil), inputRaw...))
+	}
+	return rec, nil
+}
+
+// canonicalUUID parses s as a UUID and re-formats it in the canonical 36-char
+// hyphenated lowercase form expected by Postgres uuid columns. Returns an
+// error if s is not a valid UUID.
+func canonicalUUID(s string) (string, error) {
+	parsed, err := uuid.Parse(s)
+	if err != nil {
+		return "", err
+	}
+	return parsed.String(), nil
+}
+
+// jsonOrNullObject returns raw if it carries any bytes; otherwise it returns
+// the canonical empty JSON object so the JSONB NOT NULL columns always have a
+// valid payload even when callers forget to populate them.
+func jsonOrNullObject(raw json.RawMessage) []byte {
+	if len(raw) == 0 {
+		return []byte("{}")
+	}
+	return raw
 }
 
 // joinAnd joins SQL fragments with " AND " without pulling in strings.Join uses

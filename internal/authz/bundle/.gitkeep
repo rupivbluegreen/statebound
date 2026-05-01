@@ -1,0 +1,9 @@
+Statebound built-in Rego rule library — synced into this directory at build
+time from policies/builtin/*.rego. The Makefile target `authz-sync-bundle`
+copies the rule files; the embed directive in ../embed.go picks them up via
+//go:embed all:bundle/*.rego.
+
+This file exists only so the empty bundle/ directory is committed to git and
+the embed pattern compiles before the first sync runs. Do not write Rego
+rules into this directory directly — author them in policies/builtin/ and
+re-sync.

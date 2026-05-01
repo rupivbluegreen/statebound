@@ -7,7 +7,7 @@ import (
 	"time"
 )
 
-func scopeIDPtr() *ID { id := NewID(); return &id }
+func scopeIDPtr() *ID  { id := NewID(); return &id }
 func globalIDPtr() *ID { id := NewID(); return &id }
 
 func validSudoSpec() map[string]any {

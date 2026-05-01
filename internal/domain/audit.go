@@ -33,12 +33,22 @@ const (
 	EventGlobalObjectDeleted    EventKind = "global_object.deleted"
 	EventGlobalObjectUpdated    EventKind = "global_object.updated"
 	EventModelImported          EventKind = "model.imported"
-	EventProductCreated         EventKind = "product.created"
-	EventProductDeleted         EventKind = "product.deleted"
-	EventProductUpdated         EventKind = "product.updated"
-	EventServiceAccountCreated  EventKind = "service_account.created"
-	EventServiceAccountDeleted  EventKind = "service_account.deleted"
-	EventServiceAccountUpdated  EventKind = "service_account.updated"
+	// EventPolicyEvaluated is emitted by internal/authz after every OPA
+	// evaluation of a ChangeSet (Phase 2 wave B). The payload carries the
+	// decision id, change set id, phase, outcome, bundle hash, and a compact
+	// per-rule summary; the full canonical rules/input live in the
+	// policy_decisions row referenced by decision id. EventPolicyDecisionDeny
+	// and EventPolicyDecisionEscalation are reserved for future per-rule fanout
+	// and not emitted by Phase 2 wave B.
+	EventPolicyDecisionDeny       EventKind = "policy.decision.deny"
+	EventPolicyDecisionEscalation EventKind = "policy.decision.escalation_required"
+	EventPolicyEvaluated          EventKind = "policy.evaluated"
+	EventProductCreated           EventKind = "product.created"
+	EventProductDeleted           EventKind = "product.deleted"
+	EventProductUpdated           EventKind = "product.updated"
+	EventServiceAccountCreated    EventKind = "service_account.created"
+	EventServiceAccountDeleted    EventKind = "service_account.deleted"
+	EventServiceAccountUpdated    EventKind = "service_account.updated"
 )
 
 // Sentinel errors for AuditEvent validation.
