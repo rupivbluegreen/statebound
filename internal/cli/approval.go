@@ -11,12 +11,14 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"go.opentelemetry.io/otel/codes"
 	"gopkg.in/yaml.v3"
 
 	"statebound.dev/statebound/internal/authz"
 	"statebound.dev/statebound/internal/domain"
 	"statebound.dev/statebound/internal/model"
 	"statebound.dev/statebound/internal/storage"
+	"statebound.dev/statebound/internal/telemetry"
 )
 
 func addApprovalCmd(parent *cobra.Command) {
@@ -367,6 +369,10 @@ func newApprovalRequestCmd() *cobra.Command {
 			actor := actorFromCmd(cmd)
 			csID := domain.ID(csIDStr)
 
+			if err := requireCapability(cmd.Context(), store, cmd.ErrOrStderr(), actor, domain.CapabilityChangeSetSubmit); err != nil {
+				return err
+			}
+
 			cs, err := store.GetChangeSetByID(cmd.Context(), csID)
 			if err != nil {
 				return fmt.Errorf("get change set: %w", err)
@@ -413,19 +419,47 @@ func newApprovalApproveCmd() *cobra.Command {
 // runApprove drives the Submitted -> Approved transition end-to-end. It is
 // extracted from the cobra RunE so the four-eyes test can exercise it against
 // an in-memory storage stub.
+//
+// Wave A telemetry: one "approval.approve" span per call, with the
+// change_set_id set up front and product/sequence attributes added
+// once they resolve. Errors are recorded on the span before being
+// returned so the trace tells the operator why the approval failed.
 func runApprove(ctx context.Context, store storage.Storage, w io.Writer, csID domain.ID, actor domain.Actor, reason string) error {
+	ctx, span := telemetry.StartSpan(ctx, "approval.approve",
+		telemetry.AttrChangeSetID.String(string(csID)),
+	)
+	defer span.End()
+	if telemetry.IncludeActor() {
+		span.SetAttributes(
+			telemetry.AttrActorKind.String(string(actor.Kind)),
+			telemetry.AttrActorSubject.String(actor.Subject),
+		)
+	}
+	recordErr := func(err error) error {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		return err
+	}
+
+	// Phase 8 wave A: RBAC pre-check runs before any other gate so the
+	// audit log captures denials with an authoritative payload before we
+	// touch the change set.
+	if err := requireCapability(ctx, store, nil, actor, domain.CapabilityApprove); err != nil {
+		return recordErr(err)
+	}
 	cs, err := store.GetChangeSetByID(ctx, csID)
 	if err != nil {
-		return fmt.Errorf("get change set: %w", err)
+		return recordErr(fmt.Errorf("get change set: %w", err))
 	}
+	span.SetAttributes(telemetry.AttrProductID.String(string(cs.ProductID)))
 	if cs.State != domain.ChangeSetStateSubmitted {
-		return fmt.Errorf("change set %s is %s, not submitted", shortID(csID), cs.State)
+		return recordErr(fmt.Errorf("change set %s is %s, not submitted", shortID(csID), cs.State))
 	}
 	// Four-eyes: the actor performing the approval must differ from the
 	// actor who requested the change. Compare both Kind and Subject so a
 	// human and a service account with the same subject can't slip past.
 	if cs.RequestedBy.Kind == actor.Kind && cs.RequestedBy.Subject == actor.Subject {
-		return fmt.Errorf("requester cannot approve their own change set; %s=%s", envActor, actor.Subject)
+		return recordErr(fmt.Errorf("requester cannot approve their own change set; %s=%s", envActor, actor.Subject))
 	}
 
 	productName := ""
@@ -565,15 +599,21 @@ func runApprove(ctx context.Context, store storage.Storage, w io.Writer, csID do
 		return nil
 	})
 	if err != nil {
-		return err
+		return recordErr(err)
 	}
 
 	if productName == "" {
 		productName = string(cs.ProductID)
 	}
-	_, err = fmt.Fprintf(w, "approved change set %s; created version %s:v%d; applied to live tables\n",
-		shortID(csID), productName, sequence)
-	return err
+	span.SetAttributes(
+		telemetry.AttrProductName.String(productName),
+		telemetry.AttrApprovedVersion.Int64(sequence),
+	)
+	if _, err := fmt.Fprintf(w, "approved change set %s; created version %s:v%d; applied to live tables\n",
+		shortID(csID), productName, sequence); err != nil {
+		return recordErr(err)
+	}
+	return nil
 }
 
 // loadParentSnapshotContent returns the content of the product's latest
@@ -881,6 +921,10 @@ func newApprovalRejectCmd() *cobra.Command {
 
 			actor := actorFromCmd(cmd)
 			csID := domain.ID(args[0])
+
+			if err := requireCapability(cmd.Context(), store, cmd.ErrOrStderr(), actor, domain.CapabilityReject); err != nil {
+				return err
+			}
 
 			cs, err := store.GetChangeSetByID(cmd.Context(), csID)
 			if err != nil {

@@ -209,5 +209,15 @@ jobs:
 
           ./bin/statebound audit verify
 
+          # Phase 8 wave A: RBAC bootstrap and gating.
+          # Bootstrap the first admin (no admin binding yet -> --bootstrap allowed).
+          ./bin/statebound role grant --bootstrap --actor human:ci-bot --role admin --note "CI smoke bootstrap"
+          ./bin/statebound role list --actor human:ci-bot
+          # admin can grant additional roles
+          ./bin/statebound role grant --actor human:eve --role viewer --note "test grant"
+          # without admin role, role:manage should deny — switch actor and assert non-zero exit
+          ! STATEBOUND_ACTOR=eve ./bin/statebound role grant --actor human:mallory --role admin
+          ./bin/statebound audit verify
+
           # Standalone product create still works
           ./bin/statebound product create checkout-api --owner ci-bot --description "CI smoke product"

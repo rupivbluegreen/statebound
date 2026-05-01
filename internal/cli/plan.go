@@ -24,16 +24,28 @@ import (
 	"io"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
+	"go.opentelemetry.io/otel/codes"
 
 	"statebound.dev/statebound/internal/authz"
 	"statebound.dev/statebound/internal/connectors"
 	"statebound.dev/statebound/internal/connectors/builtins"
 	"statebound.dev/statebound/internal/domain"
 	"statebound.dev/statebound/internal/model"
+	"statebound.dev/statebound/internal/signing"
 	"statebound.dev/statebound/internal/storage"
+	"statebound.dev/statebound/internal/telemetry"
 )
+
+// signingLoadPrivateKey is an alias for signing.LoadPrivateKey: this
+// indirection keeps the signing package boundary obvious in this file
+// and lets a future test swap in a fixture.
+var signingLoadPrivateKey = signing.LoadPrivateKey
+
+// signingSign is an alias for signing.Sign for the same reason.
+var signingSign = signing.Sign
 
 // addPlanCmd registers `statebound plan` on parent (root command).
 func addPlanCmd(parent *cobra.Command) {
@@ -100,7 +112,36 @@ type planArgs struct {
 // runPlan is the testable handler body. It is deliberately the only place
 // that orchestrates registry lookup, validation, plan generation, OPA
 // re-evaluation, persistence, and audit fan-out.
+//
+// The whole body runs inside a "plan.generate" span so an operator
+// browsing traces sees one row per CLI invocation, with child spans
+// around the connector call and the persistence transaction. Span
+// attributes are added incrementally as the resolution progresses
+// (product/approved-version/plan id), and any error path records the
+// error and sets the span status to Error before returning.
 func runPlan(ctx context.Context, store storage.Storage, stdout, stderr io.Writer, args planArgs) error {
+	ctx, span := telemetry.StartSpan(ctx, "plan.generate",
+		telemetry.AttrConnector.String(args.connectorName),
+		telemetry.AttrProductName.String(args.productName),
+	)
+	defer span.End()
+	if telemetry.IncludeActor() {
+		span.SetAttributes(
+			telemetry.AttrActorKind.String(string(args.actor.Kind)),
+			telemetry.AttrActorSubject.String(args.actor.Subject),
+		)
+	}
+	recordErr := func(err error) error {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		return err
+	}
+
+	// 0. RBAC pre-check: plan generation requires operator or admin.
+	if err := requireCapability(ctx, store, stderr, args.actor, domain.CapabilityPlanGenerate); err != nil {
+		return recordErr(err)
+	}
+
 	// 1. Boot connector registry.
 	registry := connectors.NewRegistry()
 	builtins.Register(registry)
@@ -111,39 +152,42 @@ func runPlan(ctx context.Context, store storage.Storage, stdout, stderr io.Write
 		for _, c := range registry.List() {
 			names = append(names, c.Name())
 		}
-		return fmt.Errorf("unknown connector %q; available: %s",
-			args.connectorName, strings.Join(names, ", "))
+		return recordErr(fmt.Errorf("unknown connector %q; available: %s",
+			args.connectorName, strings.Join(names, ", ")))
 	}
+	span.SetAttributes(telemetry.AttrConnectorVersion.String(conn.Version()))
 
 	// 2. Resolve product.
 	product, err := store.GetProductByName(ctx, args.productName)
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
-			return fmt.Errorf("product %q not found", args.productName)
+			return recordErr(fmt.Errorf("product %q not found", args.productName))
 		}
-		return fmt.Errorf("lookup product %q: %w", args.productName, err)
+		return recordErr(fmt.Errorf("lookup product %q: %w", args.productName, err))
 	}
+	span.SetAttributes(telemetry.AttrProductID.String(string(product.ID)))
 
 	// 3. Resolve approved version.
 	av, err := resolveApprovedVersion(ctx, store, product.ID, args.productName, args.versionStr)
 	if err != nil {
-		return err
+		return recordErr(err)
 	}
 	if av == nil {
-		return fmt.Errorf("%s has no approved versions yet — Plan requires approval first", args.productName)
+		return recordErr(fmt.Errorf("%s has no approved versions yet — Plan requires approval first", args.productName))
 	}
+	span.SetAttributes(telemetry.AttrApprovedVersion.Int64(av.Sequence))
 	_, snapshot, err := store.GetApprovedVersionByID(ctx, av.ID)
 	if err != nil {
-		return fmt.Errorf("load approved version snapshot: %w", err)
+		return recordErr(fmt.Errorf("load approved version snapshot: %w", err))
 	}
 	if snapshot == nil {
-		return fmt.Errorf("%s v%d has no snapshot content", args.productName, av.Sequence)
+		return recordErr(fmt.Errorf("%s v%d has no snapshot content", args.productName, av.Sequence))
 	}
 
 	// 4. Decode snapshot back into the YAML model the connector expects.
 	pam, err := model.FromSnapshot(snapshot.Content)
 	if err != nil {
-		return fmt.Errorf("decode snapshot: %w", err)
+		return recordErr(fmt.Errorf("decode snapshot: %w", err))
 	}
 
 	state := connectors.ApprovedState{
@@ -154,36 +198,62 @@ func runPlan(ctx context.Context, store storage.Storage, stdout, stderr io.Write
 		Model:             pam,
 	}
 
-	// 5. Connector pre-flight.
-	findings, err := conn.ValidateDesiredState(ctx, state)
-	if err != nil {
-		return fmt.Errorf("connector validate: %w", err)
-	}
-	hardError := false
-	for _, f := range findings {
-		fmt.Fprintf(stderr, "[%s] %s: %s\n", f.Severity, f.Path, f.Message)
-		if f.Severity == "error" {
-			hardError = true
-		}
-	}
-	if hardError {
-		return fmt.Errorf("connector %s reported validation errors; aborting plan", conn.Name())
-	}
+	// 5. Connector pre-flight + plan inside a single child span. We
+	// keep ValidateDesiredState and Plan in the same span because they
+	// are conceptually one connector round-trip from the operator's
+	// point of view; splitting them would multiply the span count
+	// without adding signal.
+	result, err := func() (*connectors.PlanResult, error) {
+		ctx, connSpan := telemetry.StartSpan(ctx, "connector.plan",
+			telemetry.AttrConnector.String(conn.Name()),
+			telemetry.AttrConnectorVersion.String(conn.Version()),
+		)
+		defer connSpan.End()
 
-	// 6. Plan.
-	result, err := conn.Plan(ctx, state)
+		findings, err := conn.ValidateDesiredState(ctx, state)
+		if err != nil {
+			connSpan.RecordError(err)
+			connSpan.SetStatus(codes.Error, err.Error())
+			return nil, fmt.Errorf("connector validate: %w", err)
+		}
+		hardError := false
+		for _, f := range findings {
+			fmt.Fprintf(stderr, "[%s] %s: %s\n", f.Severity, f.Path, f.Message)
+			if f.Severity == "error" {
+				hardError = true
+			}
+		}
+		if hardError {
+			err := fmt.Errorf("connector %s reported validation errors; aborting plan", conn.Name())
+			connSpan.RecordError(err)
+			connSpan.SetStatus(codes.Error, err.Error())
+			return nil, err
+		}
+
+		r, err := conn.Plan(ctx, state)
+		if err != nil {
+			connSpan.RecordError(err)
+			connSpan.SetStatus(codes.Error, err.Error())
+			return nil, fmt.Errorf("connector plan: %w", err)
+		}
+		if r == nil {
+			err := fmt.Errorf("connector %s returned a nil PlanResult", conn.Name())
+			connSpan.RecordError(err)
+			connSpan.SetStatus(codes.Error, err.Error())
+			return nil, err
+		}
+		connSpan.SetAttributes(telemetry.AttrItemCount.Int(len(r.Items)))
+		return r, nil
+	}()
 	if err != nil {
-		return fmt.Errorf("connector plan: %w", err)
-	}
-	if result == nil {
-		return fmt.Errorf("connector %s returned a nil PlanResult", conn.Name())
+		return recordErr(err)
 	}
 
 	// 7. Marshal canonical content bytes (no MarshalIndent — these bytes
 	// feed the SHA-256 idempotency key).
 	contentBytes, err := json.Marshal(result.Content)
 	if err != nil {
-		return fmt.Errorf("marshal plan content: %w", err)
+		return recordErr(fmt.Errorf("marshal plan content: %w", err))
 	}
 
 	// 8. Build domain plan + items.
@@ -193,13 +263,13 @@ func runPlan(ctx context.Context, store storage.Storage, stdout, stderr io.Write
 		contentBytes, result.Summary, args.actor,
 	)
 	if err != nil {
-		return fmt.Errorf("build plan: %w", err)
+		return recordErr(fmt.Errorf("build plan: %w", err))
 	}
 	domainItems := make([]*domain.PlanItem, 0, len(result.Items))
 	for i, it := range result.Items {
 		body, err := json.Marshal(it.Body)
 		if err != nil {
-			return fmt.Errorf("marshal plan item %d body: %w", i+1, err)
+			return recordErr(fmt.Errorf("marshal plan item %d body: %w", i+1, err))
 		}
 		domainItems = append(domainItems, &domain.PlanItem{
 			ID:           domain.NewID(),
@@ -239,11 +309,25 @@ func runPlan(ctx context.Context, store storage.Storage, stdout, stderr io.Write
 	}
 	eval, err := defaultEvaluator(ctx)
 	if err != nil {
-		return fmt.Errorf("plan-time policy gate: load evaluator: %w", err)
+		return recordErr(fmt.Errorf("plan-time policy gate: load evaluator: %w", err))
 	}
-	policyResult, err := eval.Evaluate(ctx, in)
+	policyResult, err := func() (*authz.PolicyResult, error) {
+		ctx, polSpan := telemetry.StartSpan(ctx, "policy.evaluate",
+			telemetry.AttrPolicyPhase.String(string(authz.PhaseApprove)),
+			telemetry.AttrChangeSetID.String(string(syntheticCS.ID)),
+		)
+		defer polSpan.End()
+		r, err := eval.Evaluate(ctx, in)
+		if err != nil {
+			polSpan.RecordError(err)
+			polSpan.SetStatus(codes.Error, err.Error())
+			return nil, err
+		}
+		polSpan.SetAttributes(telemetry.AttrPolicyOutcome.String(string(r.Outcome)))
+		return r, nil
+	}()
 	if err != nil {
-		return fmt.Errorf("plan-time policy gate: evaluate: %w", err)
+		return recordErr(fmt.Errorf("plan-time policy gate: evaluate: %w", err))
 	}
 
 	if policyResult.Outcome == authz.DecisionDeny {
@@ -266,7 +350,8 @@ func runPlan(ctx context.Context, store storage.Storage, stdout, stderr io.Write
 	//     plan id rather than minting a new one and emitting ghost
 	//     audit events that reference an unpersisted plan.
 	var reusedExisting bool
-	if err := store.WithTx(ctx, func(tx storage.Storage) error {
+	persistCtx, persistSpan := telemetry.StartSpan(ctx, "plan.persist")
+	persistErr := store.WithTx(persistCtx, func(tx storage.Storage) error {
 		existing, err := findExistingPlan(ctx, tx, av.ID, conn.Name(), plan.ContentHash)
 		if err != nil {
 			return err
@@ -339,13 +424,32 @@ func runPlan(ctx context.Context, store storage.Storage, stdout, stderr io.Write
 			return fmt.Errorf("append plan.ready audit: %w", err)
 		}
 		return nil
-	}); err != nil {
-		return err
+	})
+	persistSpan.End()
+	if persistErr != nil {
+		return recordErr(persistErr)
+	}
+
+	// Plan id and content hash are now stable; record them on the
+	// parent span so the trace links to the persisted artifact.
+	span.SetAttributes(
+		telemetry.AttrPlanID.String(string(plan.ID)),
+		telemetry.AttrPlanContentHash.String(plan.ContentHash),
+		telemetry.AttrItemCount.Int(len(domainItems)),
+	)
+
+	// 10b. Sign the plan content (Phase 8 wave A). A reused plan may
+	// already carry a signature from an earlier run; re-signing is a
+	// no-op when the same key is configured.
+	if plan.State == domain.PlanStateReady {
+		if err := signPlanContent(ctx, store, stderr, plan, contentBytes, args.actor); err != nil {
+			return recordErr(err)
+		}
 	}
 
 	// 11. Write content bytes to the sink.
 	if err := writePlanBytes(stdout, args.output, contentBytes); err != nil {
-		return err
+		return recordErr(err)
 	}
 
 	// 12. Human summary on stderr.
@@ -358,8 +462,10 @@ func runPlan(ctx context.Context, store storage.Storage, stdout, stderr io.Write
 	if reusedExisting {
 		summary += " (reused existing plan)"
 	}
-	_, err = fmt.Fprintln(stderr, summary)
-	return err
+	if _, err := fmt.Fprintln(stderr, summary); err != nil {
+		return recordErr(err)
+	}
+	return nil
 }
 
 // findExistingPlan looks up a previously-persisted plan with the same
@@ -560,4 +666,146 @@ func writePlanBytes(stdout io.Writer, output string, b []byte) error {
 		return fmt.Errorf("write %s: %w", output, err)
 	}
 	return nil
+}
+
+// signPlanContent signs the plan's canonical content bytes with the
+// signing key named by STATEBOUND_SIGNING_KEY_ID and persists the
+// resulting PlanSignature row + plan.signed audit event. Phase 8 wave A.
+//
+// Behaviour:
+//   - STATEBOUND_DEV_SKIP_PLAN_SIGNATURE=true: log a warning and return
+//     nil (no signature persisted). Used by developers and CI smoke tests.
+//   - STATEBOUND_SIGNING_KEY_ID unset (and dev-skip not set): error,
+//     refusing to mint an unsigned plan.
+//   - otherwise: load the key, resolve its private_key_ref, sign the
+//     contentBytes, persist the signature + audit event. If a signature
+//     already exists for (plan, key), return without re-signing.
+//
+// The signing failure path emits plan.signature.failed and returns a
+// non-nil error so the CLI exits non-zero in production mode.
+func signPlanContent(
+	ctx context.Context,
+	store storage.Storage,
+	stderr io.Writer,
+	plan *domain.Plan,
+	contentBytes []byte,
+	actor domain.Actor,
+) error {
+	if os.Getenv(EnvDevSkipPlanSignature) == "true" {
+		_, _ = fmt.Fprintf(stderr,
+			"WARNING: %s=true; plan %s persisted unsigned (dev mode only)\n",
+			EnvDevSkipPlanSignature, shortID(plan.ID))
+		return nil
+	}
+	keyID := os.Getenv(EnvSigningKeyID)
+	if keyID == "" {
+		return fmt.Errorf("plan signing required: set %s=<key-id> or enable dev mode (%s=true)",
+			EnvSigningKeyID, EnvDevSkipPlanSignature)
+	}
+
+	key, err := store.GetSigningKey(ctx, keyID)
+	if err != nil {
+		if errors.Is(err, storage.ErrSigningKeyNotFound) {
+			return fmt.Errorf("signing key %q not found; run `statebound key generate --key-id %s`", keyID, keyID)
+		}
+		return fmt.Errorf("load signing key: %w", err)
+	}
+	now := time.Now().UTC()
+	if !key.IsActive(now) {
+		if key.Disabled {
+			return fmt.Errorf("signing key %q is disabled", keyID)
+		}
+		return fmt.Errorf("signing key %q is expired", keyID)
+	}
+
+	// Idempotency: if a signature for (plan, key) already exists, skip.
+	existing, err := store.ListPlanSignaturesByPlan(ctx, plan.ID)
+	if err != nil {
+		return fmt.Errorf("list plan signatures: %w", err)
+	}
+	for _, s := range existing {
+		if s.KeyID == keyID {
+			_, _ = fmt.Fprintf(stderr,
+				"plan %s already signed by %s; skipping re-sign\n",
+				shortID(plan.ID), keyID)
+			return nil
+		}
+	}
+
+	priv, loadErr := signingLoadPrivateKey(key.PrivateKeyRef)
+	if loadErr != nil {
+		_ = emitPlanSignatureFailed(ctx, store, plan, keyID, actor, loadErr.Error())
+		return fmt.Errorf("load private key for %s: %w", keyID, loadErr)
+	}
+	defer zeroBytes(priv)
+
+	sigBytes, err := signingSign(contentBytes, priv)
+	if err != nil {
+		_ = emitPlanSignatureFailed(ctx, store, plan, keyID, actor, err.Error())
+		return fmt.Errorf("sign plan: %w", err)
+	}
+
+	ps, err := domain.NewPlanSignature(plan.ID, keyID, domain.AlgorithmEd25519, sigBytes, actor)
+	if err != nil {
+		return fmt.Errorf("build plan signature: %w", err)
+	}
+
+	if err := store.WithTx(ctx, func(tx storage.Storage) error {
+		if err := tx.AppendPlanSignature(ctx, ps); err != nil {
+			if errors.Is(err, storage.ErrAlreadyExists) {
+				return nil
+			}
+			return fmt.Errorf("append plan signature: %w", err)
+		}
+		_ = tx.UpdateSigningKeyLastUsed(ctx, keyID, now)
+		payload := map[string]any{
+			"plan_id":      string(plan.ID),
+			"signature_id": string(ps.ID),
+			"key_id":       keyID,
+			"fingerprint":  key.Fingerprint,
+			"algorithm":    domain.AlgorithmEd25519,
+			"content_hash": plan.ContentHash,
+		}
+		return emitAuditEvent(ctx, tx, domain.EventPlanSigned, actor, "plan_signature", string(ps.ID), payload)
+	}); err != nil {
+		return err
+	}
+
+	_, _ = fmt.Fprintf(stderr, "plan %s signed by %s (%s)\n",
+		shortID(plan.ID), keyID, shortHash(strings.TrimPrefix(key.Fingerprint, "sha256:")))
+	return nil
+}
+
+// emitPlanSignatureFailed writes a plan.signature.failed audit event so
+// the trail records why a sign-time refusal happened. Best-effort:
+// errors are returned but the caller usually wraps them as part of the
+// outer signing failure.
+func emitPlanSignatureFailed(
+	ctx context.Context,
+	store storage.Storage,
+	plan *domain.Plan,
+	keyID string,
+	actor domain.Actor,
+	reason string,
+) error {
+	payload := map[string]any{
+		"plan_id":         string(plan.ID),
+		"key_id":          keyID,
+		"failure_message": reason,
+		"phase":           "sign",
+	}
+	evt, err := domain.NewAuditEvent(domain.EventPlanSignatureFailed, actor, "plan", string(plan.ID), payload)
+	if err != nil {
+		return err
+	}
+	return store.AppendAuditEvent(ctx, evt)
+}
+
+// zeroBytes overwrites b in place. Best-effort wipe of private key
+// material. Go's GC may still leave copies behind, but we minimize
+// the lifetime of the bytes we control.
+func zeroBytes(b []byte) {
+	for i := range b {
+		b[i] = 0
+	}
 }

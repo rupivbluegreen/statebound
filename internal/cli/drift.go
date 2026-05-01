@@ -35,12 +35,14 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"go.opentelemetry.io/otel/codes"
 
 	"statebound.dev/statebound/internal/connectors"
 	"statebound.dev/statebound/internal/connectors/builtins"
 	"statebound.dev/statebound/internal/domain"
 	"statebound.dev/statebound/internal/model"
 	"statebound.dev/statebound/internal/storage"
+	"statebound.dev/statebound/internal/telemetry"
 )
 
 // addDriftCmd registers `statebound drift` and its subcommands on the
@@ -196,6 +198,29 @@ type canonicalFinding struct {
 //      drift.finding.detected events.
 //   7. Write canonical findings JSON to --output, summary line to stderr.
 func runDriftScan(ctx context.Context, store storage.Storage, stdout, stderr io.Writer, args driftScanArgs) error {
+	ctx, span := telemetry.StartSpan(ctx, "drift.scan",
+		telemetry.AttrConnector.String(args.connectorName),
+		telemetry.AttrProductName.String(args.productName),
+		telemetry.AttrSourceRef.String(args.source),
+	)
+	defer span.End()
+	if telemetry.IncludeActor() {
+		span.SetAttributes(
+			telemetry.AttrActorKind.String(string(args.actor.Kind)),
+			telemetry.AttrActorSubject.String(args.actor.Subject),
+		)
+	}
+	recordErr := func(err error) error {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		return err
+	}
+
+	// 0. RBAC pre-check: drift scans require operator or admin.
+	if err := requireCapability(ctx, store, stderr, args.actor, domain.CapabilityDriftScan); err != nil {
+		return recordErr(err)
+	}
+
 	// 1. Connector registry + capability check.
 	registry := connectors.NewRegistry()
 	builtins.Register(registry)
@@ -206,38 +231,41 @@ func runDriftScan(ctx context.Context, store storage.Storage, stdout, stderr io.
 		for _, c := range registry.List() {
 			names = append(names, c.Name())
 		}
-		return fmt.Errorf("unknown connector %q; available: %s",
-			args.connectorName, strings.Join(names, ", "))
+		return recordErr(fmt.Errorf("unknown connector %q; available: %s",
+			args.connectorName, strings.Join(names, ", ")))
 	}
 	if !connectorSupportsDrift(conn) {
-		return fmt.Errorf("connector %s does not support drift detection", conn.Name())
+		return recordErr(fmt.Errorf("connector %s does not support drift detection", conn.Name()))
 	}
+	span.SetAttributes(telemetry.AttrConnectorVersion.String(conn.Version()))
 
 	// 2. Resolve product + approved version + snapshot.
 	product, err := store.GetProductByName(ctx, args.productName)
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
-			return fmt.Errorf("product %q not found", args.productName)
+			return recordErr(fmt.Errorf("product %q not found", args.productName))
 		}
-		return fmt.Errorf("lookup product %q: %w", args.productName, err)
+		return recordErr(fmt.Errorf("lookup product %q: %w", args.productName, err))
 	}
+	span.SetAttributes(telemetry.AttrProductID.String(string(product.ID)))
 	av, err := resolveApprovedVersion(ctx, store, product.ID, args.productName, args.versionStr)
 	if err != nil {
-		return err
+		return recordErr(err)
 	}
 	if av == nil {
-		return fmt.Errorf("%s has no approved versions yet — drift scan requires approval first", args.productName)
+		return recordErr(fmt.Errorf("%s has no approved versions yet — drift scan requires approval first", args.productName))
 	}
+	span.SetAttributes(telemetry.AttrApprovedVersion.Int64(av.Sequence))
 	_, snapshot, err := store.GetApprovedVersionByID(ctx, av.ID)
 	if err != nil {
-		return fmt.Errorf("load approved version snapshot: %w", err)
+		return recordErr(fmt.Errorf("load approved version snapshot: %w", err))
 	}
 	if snapshot == nil {
-		return fmt.Errorf("%s v%d has no snapshot content", args.productName, av.Sequence)
+		return recordErr(fmt.Errorf("%s v%d has no snapshot content", args.productName, av.Sequence))
 	}
 	pam, err := model.FromSnapshot(snapshot.Content)
 	if err != nil {
-		return fmt.Errorf("decode snapshot: %w", err)
+		return recordErr(fmt.Errorf("decode snapshot: %w", err))
 	}
 
 	desired := connectors.ApprovedState{
@@ -273,8 +301,9 @@ func runDriftScan(ctx context.Context, store storage.Storage, stdout, stderr io.
 		sourceRef, args.actor,
 	)
 	if err != nil {
-		return fmt.Errorf("build drift scan: %w", err)
+		return recordErr(fmt.Errorf("build drift scan: %w", err))
 	}
+	span.SetAttributes(telemetry.AttrDriftScanID.String(string(scan.ID)))
 
 	if err := store.WithTx(ctx, func(tx storage.Storage) error {
 		if err := tx.AppendDriftScan(ctx, scan); err != nil {
@@ -305,14 +334,33 @@ func runDriftScan(ctx context.Context, store storage.Storage, stdout, stderr io.
 	}
 
 	// 4. Collect + Compare OUTSIDE any tx. These can do filesystem or
-	// network I/O and we don't want a tx open while they run.
-	actual, err := conn.CollectActualState(ctx, scope)
+	// network I/O and we don't want a tx open while they run. Wrap
+	// the connector round-trip in a child span so the operator can
+	// see the connector latency separately from our orchestration.
+	connectorFindings, err := func() ([]connectors.DriftFinding, error) {
+		ctx, connSpan := telemetry.StartSpan(ctx, "connector.drift_scan",
+			telemetry.AttrConnector.String(conn.Name()),
+			telemetry.AttrConnectorVersion.String(conn.Version()),
+			telemetry.AttrSourceRef.String(sourceRef),
+		)
+		defer connSpan.End()
+		actual, err := conn.CollectActualState(ctx, scope)
+		if err != nil {
+			connSpan.RecordError(err)
+			connSpan.SetStatus(codes.Error, err.Error())
+			return nil, fmt.Errorf("collect actual state: %w", err)
+		}
+		findings, err := conn.Compare(ctx, desired, actual)
+		if err != nil {
+			connSpan.RecordError(err)
+			connSpan.SetStatus(codes.Error, err.Error())
+			return nil, fmt.Errorf("compare: %w", err)
+		}
+		connSpan.SetAttributes(telemetry.AttrFindingCount.Int(len(findings)))
+		return findings, nil
+	}()
 	if err != nil {
-		return failDriftScan(ctx, store, stderr, scan, args.actor, fmt.Errorf("collect actual state: %w", err))
-	}
-	connectorFindings, err := conn.Compare(ctx, desired, actual)
-	if err != nil {
-		return failDriftScan(ctx, store, stderr, scan, args.actor, fmt.Errorf("compare: %w", err))
+		return recordErr(failDriftScan(ctx, store, stderr, scan, args.actor, err))
 	}
 
 	// 5. Translate connector findings into domain findings, sorted for
@@ -334,18 +382,18 @@ func runDriftScan(ctx context.Context, store storage.Storage, stdout, stderr io.
 
 		desiredJSON, err := marshalOptionalMap(cf.Desired)
 		if err != nil {
-			return failDriftScan(ctx, store, stderr, scan, args.actor,
-				fmt.Errorf("finding %d: marshal desired: %w", seq, err))
+			return recordErr(failDriftScan(ctx, store, stderr, scan, args.actor,
+				fmt.Errorf("finding %d: marshal desired: %w", seq, err)))
 		}
 		actualJSON, err := marshalOptionalMap(cf.Actual)
 		if err != nil {
-			return failDriftScan(ctx, store, stderr, scan, args.actor,
-				fmt.Errorf("finding %d: marshal actual: %w", seq, err))
+			return recordErr(failDriftScan(ctx, store, stderr, scan, args.actor,
+				fmt.Errorf("finding %d: marshal actual: %w", seq, err)))
 		}
 		diffJSON, err := marshalDiffMap(cf.Diff)
 		if err != nil {
-			return failDriftScan(ctx, store, stderr, scan, args.actor,
-				fmt.Errorf("finding %d: marshal diff: %w", seq, err))
+			return recordErr(failDriftScan(ctx, store, stderr, scan, args.actor,
+				fmt.Errorf("finding %d: marshal diff: %w", seq, err)))
 		}
 
 		df, err := domain.NewDriftFinding(
@@ -357,8 +405,8 @@ func runDriftScan(ctx context.Context, store storage.Storage, stdout, stderr io.
 			cf.Message,
 		)
 		if err != nil {
-			return failDriftScan(ctx, store, stderr, scan, args.actor,
-				fmt.Errorf("finding %d: build domain finding: %w", seq, err))
+			return recordErr(failDriftScan(ctx, store, stderr, scan, args.actor,
+				fmt.Errorf("finding %d: build domain finding: %w", seq, err)))
 		}
 		domainFindings = append(domainFindings, df)
 		wireFindings = append(wireFindings, driftScanOutputFinding{
@@ -392,8 +440,8 @@ func runDriftScan(ctx context.Context, store storage.Storage, stdout, stderr io.
 	// connector.Compare or domain.NewDriftFinding's empty-{} default).
 	summaryBytes, err := json.Marshal(canonicalFindings)
 	if err != nil {
-		return failDriftScan(ctx, store, stderr, scan, args.actor,
-			fmt.Errorf("marshal canonical findings: %w", err))
+		return recordErr(failDriftScan(ctx, store, stderr, scan, args.actor,
+			fmt.Errorf("marshal canonical findings: %w", err)))
 	}
 	sum := sha256.Sum256(summaryBytes)
 	summaryHash := "sha256:" + hex.EncodeToString(sum[:])
@@ -401,9 +449,10 @@ func runDriftScan(ctx context.Context, store storage.Storage, stdout, stderr io.
 
 	// 7. Persist findings + terminal scan + audit events in one tx.
 	if err := scan.Transition(domain.DriftScanStateSucceeded, time.Now().UTC(), summaryHash, len(domainFindings), ""); err != nil {
-		return failDriftScan(ctx, store, stderr, scan, args.actor,
-			fmt.Errorf("transition scan to succeeded: %w", err))
+		return recordErr(failDriftScan(ctx, store, stderr, scan, args.actor,
+			fmt.Errorf("transition scan to succeeded: %w", err)))
 	}
+	span.SetAttributes(telemetry.AttrFindingCount.Int(len(domainFindings)))
 
 	if err := store.WithTx(ctx, func(tx storage.Storage) error {
 		if len(domainFindings) > 0 {
@@ -459,7 +508,7 @@ func runDriftScan(ctx context.Context, store storage.Storage, stdout, stderr io.
 		}
 		return nil
 	}); err != nil {
-		return err
+		return recordErr(err)
 	}
 
 	// 8. Write canonical findings JSON to the sink.
@@ -480,7 +529,7 @@ func runDriftScan(ctx context.Context, store storage.Storage, stdout, stderr io.
 		Findings: wireFindings,
 	}
 	if err := writeDriftBytes(stdout, args.output, out); err != nil {
-		return err
+		return recordErr(err)
 	}
 
 	// 9. Human summary on stderr (so a stdout redirect captures only the
@@ -491,8 +540,10 @@ func runDriftScan(ctx context.Context, store storage.Storage, stdout, stderr io.
 		product.Name, scan.Sequence, scan.State, scan.FindingCount,
 		formatSeverityDistribution(severityDist),
 	)
-	_, err = fmt.Fprintln(stderr, summary)
-	return err
+	if _, err := fmt.Fprintln(stderr, summary); err != nil {
+		return recordErr(err)
+	}
+	return nil
 }
 
 // failDriftScan transitions the scan to Failed in a fresh tx, emits

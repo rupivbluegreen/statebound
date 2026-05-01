@@ -76,6 +76,47 @@ This is what makes the AI layer audit-defensible and what makes the
 self-governance claim honest. See `the project spec` §2 principles 11–14,
 §14, §17, §19, §22.
 
+## Operator RBAC (Phase 8 wave A)
+
+Statebound ships five non-hierarchical operator roles: `viewer`,
+`requester`, `approver`, `operator`, and `admin`. Each gated CLI
+command (model import, approval request/approve/reject, plan, drift
+scan, apply --dry-run, apply --apply, role grant/revoke) calls a
+small Go pre-check helper (`internal/cli.requireCapability`) that
+intersects the actor's currently-active roles with the roles that
+grant the requested capability. The check fires before any
+transaction opens; on denial it emits an `rbac.denied` audit event
+and returns an actionable error.
+
+Roles are non-hierarchical on purpose — `admin` does NOT auto-imply
+`approver` so segregation-of-duties detection stays clean. An actor
+that needs both responsibilities is granted both roles explicitly,
+and the audit log records both grants.
+
+The same mapping is exposed to OPA as `input.capability_roles` and
+checked by the built-in `rbac_role_required` rule
+(`policies/builtin/rbac.rego`). The Go pre-check is the authoritative
+gate; the Rego rule is the policy-decision-log audit trail. Both
+paths read `domain.RolesForCapability` so the mapping has a single
+source of truth.
+
+### Bootstrap path (known weakness)
+
+When `actor_role_bindings` is empty Statebound opens the gate for
+every operation and writes a stderr warning: this is the bootstrap
+state, where no admin yet exists to grant the first role. Operators
+seed the first admin via:
+
+```
+statebound role grant --bootstrap --actor human:alice@example.com --role admin
+```
+
+`--bootstrap` refuses once any admin binding exists, so the escape
+hatch is single-use. **In production rollouts the first admin must
+be granted before the system is exposed to non-trusted operators.**
+Documented as a known weakness for Phase 8 wave A; wave B (HTTP API
++ OIDC) closes the loop with stronger identity bindings.
+
 ## References
 
 - `the project spec` §22 — full security requirements list.
@@ -83,5 +124,7 @@ self-governance claim honest. See `the project spec` §2 principles 11–14,
 - `the project spec` §14 — agent invocation provenance.
 - `the project spec` §15 — policy and risk rules.
 - `docs/threat-model.md` — Phase 0 threat surfaces and mitigations.
+- `docs/observability.md` — OpenTelemetry tracing posture (off by
+  default; PII-safe defaults; opt-in actor attribution).
 - `docs/adr/0001-reasoning-as-addon.md` — why the AI layer is
   separable.

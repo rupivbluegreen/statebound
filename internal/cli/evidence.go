@@ -25,10 +25,12 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"go.opentelemetry.io/otel/codes"
 
 	"statebound.dev/statebound/internal/domain"
 	"statebound.dev/statebound/internal/evidence"
 	"statebound.dev/statebound/internal/storage"
+	"statebound.dev/statebound/internal/telemetry"
 )
 
 // addEvidenceCmd registers `statebound evidence` and its subcommands on the
@@ -105,19 +107,42 @@ type evidenceExportArgs struct {
 // runEvidenceExport is the testable handler body. It resolves the product,
 // the requested approved version, builds the pack, persists it inside
 // WithTx, emits both audit events, then writes the bytes to the sink.
+//
+// Wave A telemetry: one "evidence.export" span per export, with
+// product/format set up front and pack id + content hash recorded
+// after the build succeeds. Errors are recorded before returning.
 func runEvidenceExport(ctx context.Context, store storage.Storage, stdout, stderr io.Writer, args evidenceExportArgs) error {
+	ctx, span := telemetry.StartSpan(ctx, "evidence.export",
+		telemetry.AttrProductName.String(args.productName),
+		telemetry.AttrEvidenceFormat.String(args.format),
+	)
+	defer span.End()
+	if telemetry.IncludeActor() {
+		span.SetAttributes(
+			telemetry.AttrActorKind.String(string(args.actor.Kind)),
+			telemetry.AttrActorSubject.String(args.actor.Subject),
+		)
+	}
+	recordErr := func(err error) error {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		return err
+	}
+
 	product, err := store.GetProductByName(ctx, args.productName)
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
-			return fmt.Errorf("product %q not found", args.productName)
+			return recordErr(fmt.Errorf("product %q not found", args.productName))
 		}
-		return fmt.Errorf("lookup product %q: %w", args.productName, err)
+		return recordErr(fmt.Errorf("lookup product %q: %w", args.productName, err))
 	}
+	span.SetAttributes(telemetry.AttrProductID.String(string(product.ID)))
 
 	av, err := resolveApprovedVersion(ctx, store, product.ID, args.productName, args.versionStr)
 	if err != nil {
-		return err
+		return recordErr(err)
 	}
+	span.SetAttributes(telemetry.AttrApprovedVersion.Int64(av.Sequence))
 
 	// Pin the builder clock to the approved version's CreatedAt so two
 	// consecutive exports for the same (product, version, format) produce
@@ -129,18 +154,22 @@ func runEvidenceExport(ctx context.Context, store storage.Storage, stdout, stder
 	builder := evidence.NewBuilder(store).WithClock(func() time.Time { return avCreatedAt })
 	content, err := builder.BuildByVersionID(ctx, av.ID)
 	if err != nil {
-		return fmt.Errorf("build evidence pack: %w", err)
+		return recordErr(fmt.Errorf("build evidence pack: %w", err))
 	}
 
 	contentBytes, err := encodeEvidenceBytes(content, args.format)
 	if err != nil {
-		return err
+		return recordErr(err)
 	}
 
 	pack, err := domain.NewEvidencePack(product.ID, av.ID, av.Sequence, args.format, contentBytes, args.actor)
 	if err != nil {
-		return fmt.Errorf("build evidence pack record: %w", err)
+		return recordErr(fmt.Errorf("build evidence pack record: %w", err))
 	}
+	span.SetAttributes(
+		telemetry.AttrEvidencePackID.String(string(pack.ID)),
+		telemetry.AttrEvidenceContentHash.String(pack.ContentHash),
+	)
 
 	sink := evidenceSinkLabel(args.output)
 
@@ -185,20 +214,22 @@ func runEvidenceExport(ctx context.Context, store storage.Storage, stdout, stder
 		}
 		return nil
 	}); err != nil {
-		return err
+		return recordErr(err)
 	}
 
 	// Bytes go to the sink; the human summary goes to stderr so a stdout
 	// redirect captures only the pack bytes.
 	if err := writeEvidenceBytes(stdout, args.output, contentBytes); err != nil {
-		return err
+		return recordErr(err)
 	}
-	_, err = fmt.Fprintf(stderr,
+	if _, err := fmt.Fprintf(stderr,
 		"evidence pack %s (%s, sha256:%s) for %s:v%d\n",
 		shortID(pack.ID), pack.Format, shortHash(pack.ContentHash),
 		product.Name, pack.Sequence,
-	)
-	return err
+	); err != nil {
+		return recordErr(err)
+	}
+	return nil
 }
 
 // resolveApprovedVersion returns the approved-version row for the product

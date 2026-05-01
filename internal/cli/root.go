@@ -84,4 +84,6 @@ func init() {
 	addConnectorCmd(rootCmd)
 	addAgentCmd(rootCmd)
 	addInferenceCmd(rootCmd)
+	addRoleCmd(rootCmd)
+	addKeyCmd(rootCmd)
 }

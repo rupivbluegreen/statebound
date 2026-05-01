@@ -35,11 +35,47 @@ func canonicalInputJSON(in Input) ([]byte, error) {
 	if in.Approver != nil {
 		doc["approver"] = actorView(*in.Approver)
 	}
+	// Phase 8 wave A: emit a stable `actor` view that names the
+	// principal performing the lifecycle action this evaluation gates.
+	// During PhaseApprove the actor is the approver; during PhaseSubmit
+	// it is the change set's requester. Rules that key off the actor
+	// (rbac_role_required) read this; rules that key off the approver
+	// vs requester relationship (four_eyes_required) keep their existing
+	// inputs and ignore this field.
+	doc["actor"] = actorView(actorForEvaluation(in))
 	if in.BeforeModel != nil {
 		doc["before_model"] = snakeKeysAny(in.BeforeModel)
 	}
 	if in.AfterModel != nil {
 		doc["after_model"] = snakeKeysAny(in.AfterModel)
+	}
+	// RBAC fields (Phase 8 wave A). Always emit them — even an empty
+	// required_capability is a stable shape, and the rule bails out
+	// early when required_capability is "" or capability_roles is
+	// missing the cap. Stable shape == stable canonical input bytes ==
+	// stable audit hash chain.
+	doc["required_capability"] = in.RequiredCapability
+	if in.ActorRoles == nil {
+		doc["actor_roles"] = []any{}
+	} else {
+		roles := make([]any, len(in.ActorRoles))
+		for i, r := range in.ActorRoles {
+			roles[i] = r
+		}
+		doc["actor_roles"] = roles
+	}
+	if in.CapabilityRoles == nil {
+		doc["capability_roles"] = map[string]any{}
+	} else {
+		out := make(map[string]any, len(in.CapabilityRoles))
+		for k, v := range in.CapabilityRoles {
+			rs := make([]any, len(v))
+			for i, r := range v {
+				rs[i] = r
+			}
+			out[k] = rs
+		}
+		doc["capability_roles"] = out
 	}
 
 	// We marshal via a buffer so we can pass an explicit encoder if we
@@ -93,6 +129,17 @@ func changeSetView(cs domain.ChangeSet) map[string]any {
 		view["decision_reason"] = cs.DecisionReason
 	}
 	return view
+}
+
+// actorForEvaluation returns the principal whose RBAC roles gate the
+// evaluation: the approver during PhaseApprove, otherwise the change
+// set's requester. This is what `input.actor.*` resolves to in the
+// rbac_role_required rule.
+func actorForEvaluation(in Input) domain.Actor {
+	if in.Approver != nil {
+		return *in.Approver
+	}
+	return in.ChangeSet.RequestedBy
 }
 
 // actorView projects domain.Actor (kind+subject) into the snake_case shape

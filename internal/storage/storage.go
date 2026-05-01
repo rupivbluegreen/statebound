@@ -31,6 +31,20 @@ var (
 	ErrPlanApplyRecordNotFound = errors.New("storage: plan apply record not found")
 	// ErrDriftScanNotFound is returned when a drift_scans lookup misses.
 	ErrDriftScanNotFound = errors.New("storage: drift scan not found")
+	// ErrRoleBindingNotFound is returned when an actor_role_bindings lookup
+	// (or DELETE) misses. Phase 8 wave A.
+	ErrRoleBindingNotFound = errors.New("storage: role binding not found")
+	// ErrRoleBindingDuplicate is returned when AppendActorRoleBinding hits
+	// the (actor_kind, actor_subject, role) unique constraint. Callers can
+	// surface this to operators as "binding already exists" or treat it as
+	// a no-op depending on context.
+	ErrRoleBindingDuplicate = errors.New("storage: role binding already exists")
+	// ErrSigningKeyNotFound is returned when a signing_keys lookup misses.
+	// Phase 8 wave A: signed plan bundles.
+	ErrSigningKeyNotFound = errors.New("storage: signing key not found")
+	// ErrPlanSignatureNotFound is returned when a plan_signatures lookup
+	// misses. Phase 8 wave A.
+	ErrPlanSignatureNotFound = errors.New("storage: plan signature not found")
 )
 
 // AuditFilter narrows ListAuditEvents results. A zero Limit means no limit.
@@ -306,6 +320,83 @@ type DriftStore interface {
 	GetLatestDriftScanByApprovedVersion(ctx context.Context, approvedVersionID domain.ID) (*domain.DriftScan, []*domain.DriftFinding, error)
 }
 
+// ActorRoleBindingFilter narrows ListActorRoleBindings results. A zero
+// value matches every binding. OnlyActive excludes bindings whose
+// expires_at is in the past (NULL expiry is treated as active).
+type ActorRoleBindingFilter struct {
+	ActorKind    string
+	ActorSubject string
+	Role         domain.Role
+	OnlyActive   bool
+	Limit        int
+}
+
+// RBACStore persists actor_role_bindings rows and answers the hot-path
+// "what roles does this actor hold right now?" query that gates every
+// gated CLI command. Bindings are append-and-revoke: there is no
+// UPDATE method. To change a binding's expiry or note, revoke and
+// re-grant (the audit log captures both events).
+type RBACStore interface {
+	// AppendActorRoleBinding inserts a binding row. ON CONFLICT
+	// (actor_kind, actor_subject, role) DO NOTHING; on conflict the
+	// method returns ErrRoleBindingDuplicate so the caller can decide
+	// whether to surface or swallow the duplicate. The pre-check helper
+	// in the CLI surfaces it; bootstrap code may swallow it.
+	AppendActorRoleBinding(ctx context.Context, b *domain.ActorRoleBinding) error
+	// DeleteActorRoleBinding removes a binding by id. Returns
+	// ErrRoleBindingNotFound if no row matches.
+	DeleteActorRoleBinding(ctx context.Context, id domain.ID) error
+	// ListActorRoleBindings returns bindings matching filter, newest
+	// first by granted_at. An empty slice (not an error) is returned
+	// when there are no rows.
+	ListActorRoleBindings(ctx context.Context, filter ActorRoleBindingFilter) ([]*domain.ActorRoleBinding, error)
+	// ListActiveRolesForActor returns the deduplicated set of Roles the
+	// actor currently holds. This is the hot path — it is called on
+	// every gated CLI invocation. Index actor_role_bindings_active_idx
+	// supports it.
+	ListActiveRolesForActor(ctx context.Context, actor domain.Actor) ([]domain.Role, error)
+}
+
+// SigningStore persists Ed25519 signing keys (public half + reference to
+// the on-disk or env-backed private half). The store NEVER persists the
+// private key bytes; the domain.SigningKey.PrivateKey field is a transient
+// in-memory value that AppendSigningKey ignores. Phase 8 wave A.
+type SigningStore interface {
+	// AppendSigningKey inserts a row. UNIQUE violations on key_id surface
+	// as ErrAlreadyExists. The PrivateKey field on k is ignored — only
+	// the public key, fingerprint, and private_key_ref are persisted.
+	AppendSigningKey(ctx context.Context, k *domain.SigningKey) error
+	// GetSigningKey looks a key up by id. Returns ErrSigningKeyNotFound
+	// if no row matches. The returned SigningKey has PrivateKey == nil.
+	GetSigningKey(ctx context.Context, keyID string) (*domain.SigningKey, error)
+	// ListSigningKeys returns every key, newest first. When onlyActive is
+	// true, disabled keys and keys whose expires_at is in the past are
+	// excluded.
+	ListSigningKeys(ctx context.Context, onlyActive bool) ([]*domain.SigningKey, error)
+	// DisableSigningKey toggles the disabled column on an existing key.
+	// Returns ErrSigningKeyNotFound if no row matches.
+	DisableSigningKey(ctx context.Context, keyID string, disabled bool) error
+	// UpdateSigningKeyLastUsed sets last_used_at on an existing key.
+	// Best-effort: a missing key returns ErrSigningKeyNotFound but does
+	// not roll back the parent transaction (callers may swallow it).
+	UpdateSigningKeyLastUsed(ctx context.Context, keyID string, at time.Time) error
+}
+
+// PlanSignatureStore persists Ed25519 signatures attached to plans.
+// Signatures are append-only — there is no Update or Delete API.
+// Phase 8 wave A.
+type PlanSignatureStore interface {
+	// AppendPlanSignature inserts a signature row. FK violations on
+	// plan_id or key_id surface as ErrNotFound; UNIQUE violations on
+	// (plan_id, key_id, signature) surface as ErrAlreadyExists so a
+	// re-sign with identical bytes is a clear no-op.
+	AppendPlanSignature(ctx context.Context, s *domain.PlanSignature) error
+	// ListPlanSignaturesByPlan returns every signature for planID newest
+	// first (ordered by signed_at DESC, id ASC). An empty slice (not an
+	// error) is returned when there are no signatures.
+	ListPlanSignaturesByPlan(ctx context.Context, planID domain.ID) ([]*domain.PlanSignature, error)
+}
+
 // Storage is the aggregate persistence boundary used by the application layer.
 type Storage interface {
 	ProductStore
@@ -324,6 +415,9 @@ type Storage interface {
 	PlanStore
 	PlanApplyStore
 	DriftStore
+	RBACStore
+	SigningStore
+	PlanSignatureStore
 	Close(ctx context.Context) error
 	Ping(ctx context.Context) error
 	// WithTx runs fn inside a database transaction. The Storage handed to fn issues

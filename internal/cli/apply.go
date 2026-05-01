@@ -39,14 +39,21 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"go.opentelemetry.io/otel/codes"
 
 	"statebound.dev/statebound/internal/authz"
 	"statebound.dev/statebound/internal/connectors"
 	"statebound.dev/statebound/internal/connectors/builtins"
 	"statebound.dev/statebound/internal/domain"
 	"statebound.dev/statebound/internal/model"
+	"statebound.dev/statebound/internal/signing"
 	"statebound.dev/statebound/internal/storage"
+	"statebound.dev/statebound/internal/telemetry"
 )
+
+// signingVerify is an indirection over signing.Verify so an apply test
+// can inject a fixture if needed. Phase 8 wave A.
+var signingVerify = signing.Verify
 
 // addApplyCmd registers `statebound apply` on parent (root command).
 func addApplyCmd(parent *cobra.Command) {
@@ -169,10 +176,31 @@ type applyItemResultView struct {
 
 // runApply is the testable handler body. The flow is intentionally
 // linear and matches the contract in CLAUDE.md / the agent prompt.
+//
+// Wave A telemetry: every apply produces a top-level "apply.execute"
+// span, with one child span around the connector.Apply call (the only
+// step that may do real network I/O). plan_id and dry_run are recorded
+// on the parent span; connector identity is added once resolved.
 func runApply(ctx context.Context, store storage.Storage, stdout, stderr io.Writer, args applyArgs) error {
+	ctx, span := telemetry.StartSpan(ctx, "apply.execute",
+		telemetry.AttrPlanID.String(string(args.planID)),
+	)
+	defer span.End()
+	if telemetry.IncludeActor() {
+		span.SetAttributes(
+			telemetry.AttrActorKind.String(string(args.actor.Kind)),
+			telemetry.AttrActorSubject.String(args.actor.Subject),
+		)
+	}
+	recordErr := func(err error) error {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		return err
+	}
+
 	// 1. Resolve effective dry-run.
 	if args.dryRun && args.apply {
-		return fmt.Errorf("--dry-run and --apply are mutually exclusive")
+		return recordErr(fmt.Errorf("--dry-run and --apply are mutually exclusive"))
 	}
 	dryRun := args.dryRun
 	if !args.apply && !args.dryRun {
@@ -185,26 +213,43 @@ func runApply(ctx context.Context, store storage.Storage, stdout, stderr io.Writ
 		// Defense-in-depth: spec says without --apply, refuse to mutate.
 		// Reachable only if a future refactor changes the dryRun resolution
 		// above; keep the explicit check so the contract is local.
-		return fmt.Errorf("apply requires --apply flag (use --dry-run to preview without --apply)")
+		return recordErr(fmt.Errorf("apply requires --apply flag (use --dry-run to preview without --apply)"))
 	}
+	span.SetAttributes(telemetry.AttrApplyDryRun.Bool(dryRun))
 
 	if args.planID == "" {
-		return fmt.Errorf("plan id is required")
+		return recordErr(fmt.Errorf("plan id is required"))
+	}
+
+	// 1.5. RBAC pre-check: dry-run requires operator/admin; real apply
+	// requires admin. We pick the capability after dry-run resolution
+	// so a user who passes neither flag still gets the dry-run gate.
+	requiredCap := domain.CapabilityApplyDryRun
+	if !dryRun {
+		requiredCap = domain.CapabilityApply
+	}
+	if err := requireCapability(ctx, store, stderr, args.actor, requiredCap); err != nil {
+		return recordErr(err)
 	}
 
 	// 2. Load plan + items.
 	plan, planItems, err := store.GetPlanByID(ctx, args.planID)
 	if err != nil {
 		if errors.Is(err, storage.ErrPlanNotFound) || errors.Is(err, storage.ErrNotFound) {
-			return fmt.Errorf("plan %s not found", args.planID)
+			return recordErr(fmt.Errorf("plan %s not found", args.planID))
 		}
-		return fmt.Errorf("get plan %s: %w", args.planID, err)
+		return recordErr(fmt.Errorf("get plan %s: %w", args.planID, err))
 	}
+	span.SetAttributes(
+		telemetry.AttrConnector.String(plan.ConnectorName),
+		telemetry.AttrConnectorVersion.String(plan.ConnectorVersion),
+		telemetry.AttrApprovedVersion.Int64(plan.Sequence),
+	)
 
 	// 3. Gate on plan state.
 	if plan.State != domain.PlanStateReady {
-		return fmt.Errorf("plan %s is %s; only Ready plans can be applied",
-			shortID(plan.ID), plan.State)
+		return recordErr(fmt.Errorf("plan %s is %s; only Ready plans can be applied",
+			shortID(plan.ID), plan.State))
 	}
 
 	// 4. Connector registry + capability check.
@@ -217,11 +262,11 @@ func runApply(ctx context.Context, store storage.Storage, stdout, stderr io.Writ
 		for _, c := range registry.List() {
 			names = append(names, c.Name())
 		}
-		return fmt.Errorf("unknown connector %q; available: %s",
-			plan.ConnectorName, strings.Join(names, ", "))
+		return recordErr(fmt.Errorf("unknown connector %q; available: %s",
+			plan.ConnectorName, strings.Join(names, ", ")))
 	}
 	if !connectorSupportsApply(conn) {
-		return fmt.Errorf("connector %s does not support apply", conn.Name())
+		return recordErr(fmt.Errorf("connector %s does not support apply", conn.Name()))
 	}
 
 	// 5. Plan-time OPA re-evaluation against the parent approved version.
@@ -233,19 +278,28 @@ func runApply(ctx context.Context, store storage.Storage, stdout, stderr io.Writ
 		// Persist the apply attempt as Failed before surfacing the error
 		// so the audit trail records *why* the apply was refused.
 		_ = recordApplyRefusal(ctx, store, stderr, plan, args, err.Error())
-		return err
+		return recordErr(err)
+	}
+
+	// 5b. Plan-signature gate (Phase 8 wave A). The apply path requires
+	// at least one valid Ed25519 signature unless
+	// STATEBOUND_DEV_SKIP_PLAN_SIGNATURE=true. Disabled or expired keys
+	// do not count.
+	if err := verifyPlanSignatures(ctx, store, stderr, plan, args.actor); err != nil {
+		_ = recordApplyRefusal(ctx, store, stderr, plan, args, err.Error())
+		return recordErr(err)
 	}
 
 	// 6. Build connector-side PlanForApply from the persisted items.
 	planForApply, err := buildPlanForApply(plan, planItems)
 	if err != nil {
-		return fmt.Errorf("build plan-for-apply: %w", err)
+		return recordErr(fmt.Errorf("build plan-for-apply: %w", err))
 	}
 
 	// 7. Open the apply record + emit apply.started in one tx.
 	rec, err := domain.NewPlanApplyRecord(plan.ID, args.actor, args.target, dryRun)
 	if err != nil {
-		return fmt.Errorf("build plan apply record: %w", err)
+		return recordErr(fmt.Errorf("build plan apply record: %w", err))
 	}
 	if err := store.WithTx(ctx, func(tx storage.Storage) error {
 		if err := tx.AppendPlanApplyRecord(ctx, rec); err != nil {
@@ -272,45 +326,59 @@ func runApply(ctx context.Context, store storage.Storage, stdout, stderr io.Writ
 		}
 		return nil
 	}); err != nil {
-		return err
+		return recordErr(err)
 	}
+	span.SetAttributes(telemetry.AttrApplyID.String(string(rec.ID)))
 
 	// 8. Call connector.Apply OUTSIDE any tx (it may do network I/O).
-	result, applyErr := conn.Apply(ctx, planForApply, connectors.ApplyOptions{
+	// Wrap it in a child span so operators can see the connector
+	// latency separately from our orchestration overhead.
+	connCtx, connSpan := telemetry.StartSpan(ctx, "connector.apply",
+		telemetry.AttrConnector.String(conn.Name()),
+		telemetry.AttrConnectorVersion.String(conn.Version()),
+		telemetry.AttrApplyDryRun.Bool(dryRun),
+	)
+	result, applyErr := conn.Apply(connCtx, planForApply, connectors.ApplyOptions{
 		DryRun: dryRun,
 		Target: args.target,
 	})
+	if applyErr != nil {
+		connSpan.RecordError(applyErr)
+		connSpan.SetStatus(codes.Error, applyErr.Error())
+	} else if result != nil {
+		connSpan.SetAttributes(telemetry.AttrItemCount.Int(len(result.Items)))
+	}
+	connSpan.End()
 
 	// 9. Land terminal state in a fresh tx — even if the connector
 	// returned an error: the apply record must reach a terminal state.
 	finishedAt := time.Now().UTC()
 	terminalErr := finalizeApply(ctx, store, plan, rec, result, applyErr, finishedAt, args)
 	if terminalErr != nil {
-		return terminalErr
+		return recordErr(terminalErr)
 	}
 
 	// 10. Write canonical JSON to the sink.
 	out, err := buildApplyOutput(rec, result)
 	if err != nil {
-		return fmt.Errorf("build apply output: %w", err)
+		return recordErr(fmt.Errorf("build apply output: %w", err))
 	}
 	if err := writeApplyBytes(stdout, args.output, out); err != nil {
-		return err
+		return recordErr(err)
 	}
 
 	// 11. Human summary on stderr.
-	_, err = fmt.Fprintln(stderr, summarizeApply(rec, plan))
-	if err != nil {
-		return err
+	if _, err := fmt.Fprintln(stderr, summarizeApply(rec, plan)); err != nil {
+		return recordErr(err)
 	}
 
 	// 12. If the connector reported a hard error, surface it after the
 	// record + audit have been persisted so the operator sees the cause.
 	if applyErr != nil {
-		return applyErr
+		return recordErr(applyErr)
 	}
 	if rec.State == domain.PlanApplyStateFailed {
-		return fmt.Errorf("apply failed: %s", rec.FailureMessage)
+		return recordErr(fmt.Errorf("apply failed: %s", rec.FailureMessage))
 	}
 	return nil
 }
@@ -728,4 +796,108 @@ func writeApplyBytes(stdout io.Writer, output string, out applyOutput) error {
 		return fmt.Errorf("write %s: %w", output, err)
 	}
 	return nil
+}
+
+// verifyPlanSignatures requires at least one valid Ed25519 signature on
+// the plan unless STATEBOUND_DEV_SKIP_PLAN_SIGNATURE=true. Disabled and
+// expired keys are skipped (with warnings); a plan whose only signers
+// have been disabled or expired is refused. Phase 8 wave A.
+//
+// On success, emits plan.signature.verified. On every kind of failure
+// path emits plan.signature.failed before returning. The caller writes
+// an additional plan_apply Failed record via recordApplyRefusal.
+func verifyPlanSignatures(
+	ctx context.Context,
+	store storage.Storage,
+	stderr io.Writer,
+	plan *domain.Plan,
+	actor domain.Actor,
+) error {
+	if os.Getenv(EnvDevSkipPlanSignature) == "true" {
+		_, _ = fmt.Fprintf(stderr,
+			"WARNING: %s=true; skipping plan signature verification (dev mode only)\n",
+			EnvDevSkipPlanSignature)
+		return nil
+	}
+
+	signatures, err := store.ListPlanSignaturesByPlan(ctx, plan.ID)
+	if err != nil {
+		return fmt.Errorf("list plan signatures: %w", err)
+	}
+	if len(signatures) == 0 {
+		reason := fmt.Sprintf("plan %s has no signatures; refusing to apply", shortID(plan.ID))
+		_ = emitVerifyFailed(ctx, store, plan, "", actor, reason)
+		return fmt.Errorf("%s", reason)
+	}
+
+	now := time.Now().UTC()
+	validKeys := make([]string, 0)
+	for _, sig := range signatures {
+		key, err := store.GetSigningKey(ctx, sig.KeyID)
+		if err != nil {
+			if errors.Is(err, storage.ErrSigningKeyNotFound) {
+				_, _ = fmt.Fprintf(stderr,
+					"WARNING: plan %s signed by missing key %q; skipping\n",
+					shortID(plan.ID), sig.KeyID)
+				continue
+			}
+			return fmt.Errorf("load signing key %s: %w", sig.KeyID, err)
+		}
+		if !key.IsValidForVerification(now) {
+			cause := "disabled"
+			if !key.Disabled && key.ExpiresAt != nil && !key.ExpiresAt.After(now) {
+				cause = "expired"
+			}
+			_, _ = fmt.Fprintf(stderr,
+				"WARNING: plan %s signature from key %q skipped (%s)\n",
+				shortID(plan.ID), key.KeyID, cause)
+			continue
+		}
+		if err := signingVerify(plan.Content, sig.Signature, key.PublicKey); err != nil {
+			reason := fmt.Sprintf("plan signature verification failed for key %q: %v", sig.KeyID, err)
+			_ = emitVerifyFailed(ctx, store, plan, sig.KeyID, actor, reason)
+			return fmt.Errorf("%s", reason)
+		}
+		validKeys = append(validKeys, sig.KeyID)
+	}
+
+	if len(validKeys) == 0 {
+		reason := fmt.Sprintf("plan %s has signatures but none are issued by an active key", shortID(plan.ID))
+		_ = emitVerifyFailed(ctx, store, plan, "", actor, reason)
+		return fmt.Errorf("%s", reason)
+	}
+
+	// Best-effort audit: verified.
+	payload := map[string]any{
+		"plan_id":      string(plan.ID),
+		"key_ids":      validKeys,
+		"content_hash": plan.ContentHash,
+	}
+	evt, evtErr := domain.NewAuditEvent(domain.EventPlanSignatureVerified, actor, "plan", string(plan.ID), payload)
+	if evtErr == nil {
+		_ = store.AppendAuditEvent(ctx, evt)
+	}
+	return nil
+}
+
+// emitVerifyFailed writes plan.signature.failed (apply phase).
+func emitVerifyFailed(
+	ctx context.Context,
+	store storage.Storage,
+	plan *domain.Plan,
+	keyID string,
+	actor domain.Actor,
+	reason string,
+) error {
+	payload := map[string]any{
+		"plan_id":         string(plan.ID),
+		"key_id":          keyID,
+		"failure_message": reason,
+		"phase":           "verify",
+	}
+	evt, err := domain.NewAuditEvent(domain.EventPlanSignatureFailed, actor, "plan", string(plan.ID), payload)
+	if err != nil {
+		return err
+	}
+	return store.AppendAuditEvent(ctx, evt)
 }

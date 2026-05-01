@@ -89,15 +89,24 @@ type PolicyResult struct {
 // during PhaseSubmit; BeforeModel/AfterModel are optional model snapshots
 // that some rules may consult once the rule library grows beyond the
 // initial eight (Phase 2 rules look only at items + approvals).
+//
+// RBAC fields (Phase 8 wave A) carry the per-evaluation RBAC context for
+// the rbac_role_required rule. RequiredCapability is the action the
+// caller is gating (e.g. "changeset:approve"); ActorRoles is the actor's
+// currently active roles; CapabilityRoles is the capability-to-roles
+// mapping. Empty slices/maps disable the rule (it bails out early).
 type Input struct {
-	Phase       EvalPhase
-	Product     domain.Product
-	ChangeSet   domain.ChangeSet
-	Items       []*domain.ChangeSetItem
-	Approvals   []*domain.Approval
-	Approver    *domain.Actor
-	BeforeModel map[string]any
-	AfterModel  map[string]any
+	Phase              EvalPhase
+	Product            domain.Product
+	ChangeSet          domain.ChangeSet
+	Items              []*domain.ChangeSetItem
+	Approvals          []*domain.Approval
+	Approver           *domain.Actor
+	BeforeModel        map[string]any
+	AfterModel         map[string]any
+	RequiredCapability string
+	ActorRoles         []string
+	CapabilityRoles    map[string][]string
 }
 
 // Evaluator runs the embedded Rego bundle against an Input. Implementations

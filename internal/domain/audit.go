@@ -45,6 +45,16 @@ const (
 	EventPlanGenerated          EventKind = "plan.generated"
 	EventPlanReady              EventKind = "plan.ready"
 	EventPlanRefused            EventKind = "plan.refused"
+	// Phase 8 wave A — signed plan bundles. Plan signing happens at plan
+	// generation time; verification gates the apply path. Key lifecycle
+	// events cover generate/disable/expire so an auditor can prove which
+	// keys were live when a given signature was issued.
+	EventPlanSigned            EventKind = "plan.signed"
+	EventPlanSignatureVerified EventKind = "plan.signature.verified"
+	EventPlanSignatureFailed   EventKind = "plan.signature.failed"
+	EventSigningKeyGenerated   EventKind = "signing.key.generated"
+	EventSigningKeyDisabled    EventKind = "signing.key.disabled"
+	EventSigningKeyExpired     EventKind = "signing.key.expired"
 	// EventPolicyEvaluated is emitted by internal/authz after every OPA
 	// evaluation of a ChangeSet (Phase 2 wave B). The payload carries the
 	// decision id, change set id, phase, outcome, bundle hash, and a compact
@@ -58,9 +68,20 @@ const (
 	EventProductCreated           EventKind = "product.created"
 	EventProductDeleted           EventKind = "product.deleted"
 	EventProductUpdated           EventKind = "product.updated"
-	EventServiceAccountCreated    EventKind = "service_account.created"
-	EventServiceAccountDeleted    EventKind = "service_account.deleted"
-	EventServiceAccountUpdated    EventKind = "service_account.updated"
+	// EventRBACDenied is emitted by internal/cli.requireCapability when the
+	// pre-check rejects an actor for a capability they do not hold. The
+	// payload carries the actor, the capability, the required roles, and
+	// the actor's currently granted roles. Phase 8 wave A.
+	EventRBACDenied EventKind = "rbac.denied"
+	// EventRoleBindingGranted is emitted when an admin (or the bootstrap
+	// flag) creates a new actor_role_bindings row.
+	EventRoleBindingGranted EventKind = "rbac.binding.granted"
+	// EventRoleBindingRevoked is emitted when an admin deletes an
+	// actor_role_bindings row.
+	EventRoleBindingRevoked    EventKind = "rbac.binding.revoked"
+	EventServiceAccountCreated EventKind = "service_account.created"
+	EventServiceAccountDeleted EventKind = "service_account.deleted"
+	EventServiceAccountUpdated EventKind = "service_account.updated"
 )
 
 // Sentinel errors for AuditEvent validation.

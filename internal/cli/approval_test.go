@@ -126,6 +126,21 @@ type fourEyesStub struct {
 func (s *fourEyesStub) Close(_ context.Context) error { return nil }
 func (s *fourEyesStub) Ping(_ context.Context) error  { return nil }
 
+// ListActorRoleBindings is the bootstrap-path query: returning an empty
+// slice opens the gate for the four-eyes test (RBAC kicks in only once
+// at least one binding exists).
+func (s *fourEyesStub) ListActorRoleBindings(_ context.Context, _ storage.ActorRoleBindingFilter) ([]*domain.ActorRoleBinding, error) {
+	return nil, nil
+}
+
+// ListActiveRolesForActor is unreachable when ListActorRoleBindings
+// returns empty, but the embedded nil interface would panic on
+// accidental wider coverage. Defining it as a clear stub error keeps
+// the surprise visible.
+func (s *fourEyesStub) ListActiveRolesForActor(_ context.Context, _ domain.Actor) ([]domain.Role, error) {
+	return nil, nil
+}
+
 func (s *fourEyesStub) GetChangeSetByID(_ context.Context, id domain.ID) (*domain.ChangeSet, error) {
 	cs, ok := s.changeSets[id]
 	if !ok {

@@ -67,6 +67,9 @@ func newModelImportCmd() *cobra.Command {
 			defer func() { _ = store.Close(cmd.Context()) }()
 
 			actor := actorFromCmd(cmd)
+			if err := requireCapability(cmd.Context(), store, cmd.ErrOrStderr(), actor, domain.CapabilityChangeSetCreate); err != nil {
+				return err
+			}
 			mode := model.ImportModeChangeSet
 			if autoApprove {
 				if os.Getenv(envAutoApprove) != "true" {

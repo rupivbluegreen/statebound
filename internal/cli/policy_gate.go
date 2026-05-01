@@ -6,9 +6,12 @@ import (
 	"strings"
 	"sync"
 
+	"go.opentelemetry.io/otel/codes"
+
 	"statebound.dev/statebound/internal/authz"
 	"statebound.dev/statebound/internal/domain"
 	"statebound.dev/statebound/internal/storage"
+	"statebound.dev/statebound/internal/telemetry"
 )
 
 // evaluatorOnce caches the prepared OPA evaluator across all CLI invocations
@@ -39,6 +42,10 @@ var evaluatePolicyGate = evaluateAndRecord
 // store may be a transaction or the top-level pool — Record uses the same
 // interface either way, so wrapping in WithTx makes the gate atomic with
 // the surrounding state transition.
+//
+// Wave A telemetry: every gate evaluation runs inside a "policy.evaluate"
+// span tagged with phase + change_set_id; outcome is recorded once
+// evaluation succeeds. Errors set span status to Error.
 func evaluateAndRecord(
 	ctx context.Context,
 	store storage.Storage,
@@ -46,17 +53,28 @@ func evaluateAndRecord(
 	cs *domain.ChangeSet,
 	actor domain.Actor,
 ) (*authz.PolicyResult, error) {
+	ctx, span := telemetry.StartSpan(ctx, "policy.evaluate",
+		telemetry.AttrPolicyPhase.String(string(phase)),
+		telemetry.AttrChangeSetID.String(string(cs.ID)),
+	)
+	defer span.End()
+	recordErr := func(err error) error {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		return err
+	}
+
 	product, err := store.GetProductByID(ctx, cs.ProductID)
 	if err != nil {
-		return nil, fmt.Errorf("policy gate: get product: %w", err)
+		return nil, recordErr(fmt.Errorf("policy gate: get product: %w", err))
 	}
 	items, err := store.ListChangeSetItems(ctx, cs.ID)
 	if err != nil {
-		return nil, fmt.Errorf("policy gate: list items: %w", err)
+		return nil, recordErr(fmt.Errorf("policy gate: list items: %w", err))
 	}
 	approvals, err := store.ListApprovalsByChangeSet(ctx, cs.ID)
 	if err != nil {
-		return nil, fmt.Errorf("policy gate: list approvals: %w", err)
+		return nil, recordErr(fmt.Errorf("policy gate: list approvals: %w", err))
 	}
 
 	in := authz.Input{
@@ -73,16 +91,17 @@ func evaluateAndRecord(
 
 	eval, err := defaultEvaluator(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("policy gate: load evaluator: %w", err)
+		return nil, recordErr(fmt.Errorf("policy gate: load evaluator: %w", err))
 	}
 	result, err := eval.Evaluate(ctx, in)
 	if err != nil {
-		return nil, fmt.Errorf("policy gate: evaluate: %w", err)
+		return nil, recordErr(fmt.Errorf("policy gate: evaluate: %w", err))
 	}
 	result.ChangeSetID = cs.ID
+	span.SetAttributes(telemetry.AttrPolicyOutcome.String(string(result.Outcome)))
 
 	if err := authz.Record(ctx, store, actor, result); err != nil {
-		return nil, fmt.Errorf("policy gate: record decision: %w", err)
+		return nil, recordErr(fmt.Errorf("policy gate: record decision: %w", err))
 	}
 	return result, nil
 }

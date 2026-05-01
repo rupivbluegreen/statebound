@@ -3437,5 +3437,485 @@ func scanPlanApplyRecord(r scannable) (*domain.PlanApplyRecord, error) {
 	return rec, nil
 }
 
+// -------- Actor Role Bindings (RBAC) --------
+
+const actorRoleBindingColumns = "id, actor_kind, actor_subject, role, granted_by_kind, granted_by_subject, granted_at, expires_at, note"
+
+// AppendActorRoleBinding inserts a binding row. The UNIQUE
+// (actor_kind, actor_subject, role) constraint is intentional: a
+// duplicate grant returns ErrRoleBindingDuplicate so the audit log
+// captures every attempt rather than silently no-op'ing. Bootstrap
+// callers may swallow the error; user-facing CLI surfaces it.
+func (s *Store) AppendActorRoleBinding(ctx context.Context, b *domain.ActorRoleBinding) error {
+	const q = `
+INSERT INTO actor_role_bindings (
+  id, actor_kind, actor_subject, role,
+  granted_by_kind, granted_by_subject, granted_at, expires_at, note
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+ON CONFLICT (actor_kind, actor_subject, role) DO NOTHING
+`
+	tag, err := s.q.Exec(ctx, q,
+		string(b.ID),
+		string(b.Actor.Kind),
+		b.Actor.Subject,
+		string(b.Role),
+		string(b.GrantedBy.Kind),
+		b.GrantedBy.Subject,
+		b.GrantedAt,
+		b.ExpiresAt,
+		b.Note,
+	)
+	if err != nil {
+		return fmt.Errorf("postgres: insert actor_role_binding: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return storage.ErrRoleBindingDuplicate
+	}
+	return nil
+}
+
+// DeleteActorRoleBinding removes a binding by id. ErrRoleBindingNotFound
+// is returned when no row matches so the caller can decide whether
+// "already gone" is acceptable.
+func (s *Store) DeleteActorRoleBinding(ctx context.Context, id domain.ID) error {
+	const q = `DELETE FROM actor_role_bindings WHERE id = $1`
+	tag, err := s.q.Exec(ctx, q, string(id))
+	if err != nil {
+		return fmt.Errorf("postgres: delete actor_role_binding: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return storage.ErrRoleBindingNotFound
+	}
+	return nil
+}
+
+// ListActorRoleBindings returns bindings matching filter, newest first
+// (granted_at DESC, id ASC for stable ordering across equal timestamps).
+func (s *Store) ListActorRoleBindings(ctx context.Context, f storage.ActorRoleBindingFilter) ([]*domain.ActorRoleBinding, error) {
+	q := `SELECT ` + actorRoleBindingColumns + ` FROM actor_role_bindings`
+	args := make([]any, 0, 4)
+	clauses := make([]string, 0, 4)
+
+	if f.ActorKind != "" {
+		args = append(args, f.ActorKind)
+		clauses = append(clauses, fmt.Sprintf("actor_kind = $%d", len(args)))
+	}
+	if f.ActorSubject != "" {
+		args = append(args, f.ActorSubject)
+		clauses = append(clauses, fmt.Sprintf("actor_subject = $%d", len(args)))
+	}
+	if f.Role != "" {
+		args = append(args, string(f.Role))
+		clauses = append(clauses, fmt.Sprintf("role = $%d", len(args)))
+	}
+	if f.OnlyActive {
+		clauses = append(clauses, "(expires_at IS NULL OR expires_at > now())")
+	}
+
+	if len(clauses) > 0 {
+		q += " WHERE " + joinAnd(clauses)
+	}
+	q += " ORDER BY granted_at DESC, id ASC"
+	if f.Limit > 0 {
+		args = append(args, f.Limit)
+		q += fmt.Sprintf(" LIMIT $%d", len(args))
+	}
+
+	rows, err := s.q.Query(ctx, q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: list actor_role_bindings: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]*domain.ActorRoleBinding, 0)
+	for rows.Next() {
+		b, err := scanActorRoleBinding(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, b)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("postgres: iterate actor_role_bindings: %w", err)
+	}
+	return out, nil
+}
+
+// ListActiveRolesForActor returns the deduplicated set of Roles the
+// actor currently holds. This is the hot path called on every gated
+// CLI invocation; the partial index actor_role_bindings_active_idx
+// supports it.
+func (s *Store) ListActiveRolesForActor(ctx context.Context, actor domain.Actor) ([]domain.Role, error) {
+	const q = `
+SELECT DISTINCT role
+FROM actor_role_bindings
+WHERE actor_kind = $1
+  AND actor_subject = $2
+  AND (expires_at IS NULL OR expires_at > now())
+ORDER BY role ASC
+`
+	rows, err := s.q.Query(ctx, q, string(actor.Kind), actor.Subject)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: list active roles: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]domain.Role, 0)
+	for rows.Next() {
+		var r string
+		if err := rows.Scan(&r); err != nil {
+			return nil, fmt.Errorf("postgres: scan active role: %w", err)
+		}
+		out = append(out, domain.Role(r))
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("postgres: iterate active roles: %w", err)
+	}
+	return out, nil
+}
+
+func scanActorRoleBinding(r scannable) (*domain.ActorRoleBinding, error) {
+	var (
+		id, actorKind, actorSubject, role           string
+		grantedByKind, grantedBySubject, note       string
+		grantedAt                                   time.Time
+		expiresAt                                   *time.Time
+	)
+	err := r.Scan(
+		&id, &actorKind, &actorSubject, &role,
+		&grantedByKind, &grantedBySubject, &grantedAt, &expiresAt, &note,
+	)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, storage.ErrRoleBindingNotFound
+		}
+		return nil, fmt.Errorf("postgres: scan actor_role_binding: %w", err)
+	}
+	return &domain.ActorRoleBinding{
+		ID:        domain.ID(id),
+		Actor:     domain.Actor{Kind: domain.ActorKind(actorKind), Subject: actorSubject},
+		Role:      domain.Role(role),
+		GrantedBy: domain.Actor{Kind: domain.ActorKind(grantedByKind), Subject: grantedBySubject},
+		GrantedAt: grantedAt,
+		ExpiresAt: expiresAt,
+		Note:      note,
+	}, nil
+}
+
+// -------- Signing keys --------
+
+const signingKeyColumns = "key_id, algorithm, public_key, fingerprint, private_key_ref, " +
+	"created_by_kind, created_by_subject, created_at, expires_at, disabled, note, last_used_at"
+
+// AppendSigningKey inserts a signing_keys row. The PrivateKey field on
+// k is intentionally ignored — only the public key, fingerprint, and
+// private_key_ref are persisted. UNIQUE violations on key_id surface as
+// ErrAlreadyExists so the CLI can offer a clear "key id already in use"
+// message.
+func (s *Store) AppendSigningKey(ctx context.Context, k *domain.SigningKey) error {
+	if k == nil {
+		return storage.ErrInvalidArgument
+	}
+	if k.KeyID == "" {
+		return fmt.Errorf("%w: signing key id", storage.ErrInvalidArgument)
+	}
+	if k.Algorithm != domain.AlgorithmEd25519 {
+		return fmt.Errorf("%w: signing key algorithm %q", storage.ErrInvalidArgument, k.Algorithm)
+	}
+	if len(k.PublicKey) != 32 {
+		return fmt.Errorf("%w: signing key public key bytes", storage.ErrInvalidArgument)
+	}
+	if k.Fingerprint == "" {
+		return fmt.Errorf("%w: signing key fingerprint", storage.ErrInvalidArgument)
+	}
+	if k.PrivateKeyRef == "" {
+		return fmt.Errorf("%w: signing key private_key_ref", storage.ErrInvalidArgument)
+	}
+	if err := k.CreatedBy.Validate(); err != nil {
+		return fmt.Errorf("%w: %v", storage.ErrInvalidArgument, err)
+	}
+	if k.CreatedAt.IsZero() {
+		k.CreatedAt = time.Now().UTC()
+	}
+
+	const q = `
+INSERT INTO signing_keys (
+  key_id, algorithm, public_key, fingerprint, private_key_ref,
+  created_by_kind, created_by_subject, created_at, expires_at,
+  disabled, note, last_used_at
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+`
+	var expiresAt any
+	if k.ExpiresAt != nil {
+		expiresAt = *k.ExpiresAt
+	}
+	var lastUsedAt any
+	if k.LastUsedAt != nil {
+		lastUsedAt = *k.LastUsedAt
+	}
+
+	_, err := s.q.Exec(ctx, q,
+		k.KeyID,
+		k.Algorithm,
+		k.PublicKey,
+		k.Fingerprint,
+		k.PrivateKeyRef,
+		string(k.CreatedBy.Kind),
+		k.CreatedBy.Subject,
+		k.CreatedAt,
+		expiresAt,
+		k.Disabled,
+		k.Note,
+		lastUsedAt,
+	)
+	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) {
+			switch pgErr.Code {
+			case pgUniqueViolation:
+				return storage.ErrAlreadyExists
+			case pgCheckViolation:
+				return fmt.Errorf("%w: %s", storage.ErrInvalidArgument, pgErr.ConstraintName)
+			}
+		}
+		return fmt.Errorf("postgres: insert signing_key: %w", err)
+	}
+	return nil
+}
+
+// GetSigningKey returns a single key by id, or ErrSigningKeyNotFound.
+func (s *Store) GetSigningKey(ctx context.Context, keyID string) (*domain.SigningKey, error) {
+	if keyID == "" {
+		return nil, storage.ErrInvalidArgument
+	}
+	const q = `SELECT ` + signingKeyColumns + ` FROM signing_keys WHERE key_id = $1`
+	row := s.q.QueryRow(ctx, q, keyID)
+	k, err := scanSigningKey(row)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			return nil, storage.ErrSigningKeyNotFound
+		}
+		return nil, err
+	}
+	return k, nil
+}
+
+// ListSigningKeys returns every key newest first. When onlyActive is
+// true, disabled keys and keys whose expires_at is in the past are
+// excluded — this is the default for `statebound key list`.
+func (s *Store) ListSigningKeys(ctx context.Context, onlyActive bool) ([]*domain.SigningKey, error) {
+	q := `SELECT ` + signingKeyColumns + ` FROM signing_keys`
+	args := make([]any, 0, 1)
+	if onlyActive {
+		q += ` WHERE disabled = FALSE AND (expires_at IS NULL OR expires_at > $1)`
+		args = append(args, time.Now().UTC())
+	}
+	q += ` ORDER BY created_at DESC, key_id ASC`
+	rows, err := s.q.Query(ctx, q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: list signing_keys: %w", err)
+	}
+	defer rows.Close()
+	out := make([]*domain.SigningKey, 0)
+	for rows.Next() {
+		k, err := scanSigningKey(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, k)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("postgres: iterate signing_keys: %w", err)
+	}
+	return out, nil
+}
+
+// DisableSigningKey toggles the disabled column. Returns
+// ErrSigningKeyNotFound if no row matches.
+func (s *Store) DisableSigningKey(ctx context.Context, keyID string, disabled bool) error {
+	if keyID == "" {
+		return storage.ErrInvalidArgument
+	}
+	const q = `UPDATE signing_keys SET disabled = $2 WHERE key_id = $1`
+	tag, err := s.q.Exec(ctx, q, keyID, disabled)
+	if err != nil {
+		return fmt.Errorf("postgres: update signing_key disabled: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return storage.ErrSigningKeyNotFound
+	}
+	return nil
+}
+
+// UpdateSigningKeyLastUsed sets last_used_at on an existing key.
+func (s *Store) UpdateSigningKeyLastUsed(ctx context.Context, keyID string, at time.Time) error {
+	if keyID == "" {
+		return storage.ErrInvalidArgument
+	}
+	const q = `UPDATE signing_keys SET last_used_at = $2 WHERE key_id = $1`
+	tag, err := s.q.Exec(ctx, q, keyID, at)
+	if err != nil {
+		return fmt.Errorf("postgres: update signing_key last_used_at: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return storage.ErrSigningKeyNotFound
+	}
+	return nil
+}
+
+func scanSigningKey(r scannable) (*domain.SigningKey, error) {
+	var (
+		keyID, algorithm, fingerprint, privateKeyRef string
+		publicKey                                    []byte
+		createdByKind, createdBySubject              string
+		createdAt                                    time.Time
+		expiresAt                                    *time.Time
+		disabled                                     bool
+		note                                         string
+		lastUsedAt                                   *time.Time
+	)
+	err := r.Scan(
+		&keyID, &algorithm, &publicKey, &fingerprint, &privateKeyRef,
+		&createdByKind, &createdBySubject, &createdAt, &expiresAt,
+		&disabled, &note, &lastUsedAt,
+	)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, storage.ErrNotFound
+		}
+		return nil, fmt.Errorf("postgres: scan signing_key: %w", err)
+	}
+	return &domain.SigningKey{
+		KeyID:         keyID,
+		Algorithm:     algorithm,
+		PublicKey:     append([]byte(nil), publicKey...),
+		Fingerprint:   fingerprint,
+		PrivateKeyRef: privateKeyRef,
+		CreatedBy:     domain.Actor{Kind: domain.ActorKind(createdByKind), Subject: createdBySubject},
+		CreatedAt:     createdAt,
+		ExpiresAt:     expiresAt,
+		Disabled:      disabled,
+		Note:          note,
+		LastUsedAt:    lastUsedAt,
+	}, nil
+}
+
+// -------- Plan signatures --------
+
+const planSignatureColumns = "id, plan_id, key_id, algorithm, signature, " +
+	"signed_by_kind, signed_by_subject, signed_at"
+
+// AppendPlanSignature inserts a plan_signatures row. FK violations on
+// plan_id or key_id surface as ErrNotFound; UNIQUE on (plan_id, key_id,
+// signature) surfaces as ErrAlreadyExists.
+func (s *Store) AppendPlanSignature(ctx context.Context, sig *domain.PlanSignature) error {
+	if sig == nil {
+		return storage.ErrInvalidArgument
+	}
+	if sig.ID == "" {
+		return fmt.Errorf("%w: plan signature id", storage.ErrInvalidArgument)
+	}
+	if sig.PlanID == "" {
+		return fmt.Errorf("%w: plan signature plan id", storage.ErrInvalidArgument)
+	}
+	if sig.KeyID == "" {
+		return fmt.Errorf("%w: plan signature key id", storage.ErrInvalidArgument)
+	}
+	if sig.Algorithm != domain.AlgorithmEd25519 {
+		return fmt.Errorf("%w: plan signature algorithm %q", storage.ErrInvalidArgument, sig.Algorithm)
+	}
+	if len(sig.Signature) != 64 {
+		return fmt.Errorf("%w: plan signature bytes", storage.ErrInvalidArgument)
+	}
+	if err := sig.SignedBy.Validate(); err != nil {
+		return fmt.Errorf("%w: %v", storage.ErrInvalidArgument, err)
+	}
+	if sig.SignedAt.IsZero() {
+		sig.SignedAt = time.Now().UTC()
+	}
+	const q = `
+INSERT INTO plan_signatures (
+  id, plan_id, key_id, algorithm, signature,
+  signed_by_kind, signed_by_subject, signed_at
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+`
+	_, err := s.q.Exec(ctx, q,
+		string(sig.ID),
+		string(sig.PlanID),
+		sig.KeyID,
+		sig.Algorithm,
+		sig.Signature,
+		string(sig.SignedBy.Kind),
+		sig.SignedBy.Subject,
+		sig.SignedAt,
+	)
+	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) {
+			switch pgErr.Code {
+			case pgUniqueViolation:
+				return storage.ErrAlreadyExists
+			case pgForeignKeyViolation:
+				return fmt.Errorf("%w: %s", storage.ErrNotFound, pgErr.ConstraintName)
+			case pgCheckViolation:
+				return fmt.Errorf("%w: %s", storage.ErrInvalidArgument, pgErr.ConstraintName)
+			}
+		}
+		return fmt.Errorf("postgres: insert plan_signature: %w", err)
+	}
+	return nil
+}
+
+// ListPlanSignaturesByPlan returns every signature for planID newest
+// first.
+func (s *Store) ListPlanSignaturesByPlan(ctx context.Context, planID domain.ID) ([]*domain.PlanSignature, error) {
+	if planID == "" {
+		return nil, storage.ErrInvalidArgument
+	}
+	const q = `SELECT ` + planSignatureColumns + ` FROM plan_signatures WHERE plan_id = $1 ORDER BY signed_at DESC, id ASC`
+	rows, err := s.q.Query(ctx, q, string(planID))
+	if err != nil {
+		return nil, fmt.Errorf("postgres: list plan_signatures: %w", err)
+	}
+	defer rows.Close()
+	out := make([]*domain.PlanSignature, 0)
+	for rows.Next() {
+		sig, err := scanPlanSignature(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, sig)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("postgres: iterate plan_signatures: %w", err)
+	}
+	return out, nil
+}
+
+func scanPlanSignature(r scannable) (*domain.PlanSignature, error) {
+	var (
+		id, planID, keyID, algorithm string
+		signature                    []byte
+		signedByKind, signedBySubject string
+		signedAt                     time.Time
+	)
+	err := r.Scan(&id, &planID, &keyID, &algorithm, &signature, &signedByKind, &signedBySubject, &signedAt)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, storage.ErrNotFound
+		}
+		return nil, fmt.Errorf("postgres: scan plan_signature: %w", err)
+	}
+	return &domain.PlanSignature{
+		ID:        domain.ID(id),
+		PlanID:    domain.ID(planID),
+		KeyID:     keyID,
+		Algorithm: algorithm,
+		Signature: append([]byte(nil), signature...),
+		SignedBy:  domain.Actor{Kind: domain.ActorKind(signedByKind), Subject: signedBySubject},
+		SignedAt:  signedAt,
+	}, nil
+}
+
 // Compile-time assertion that *Store satisfies storage.Storage.
 var _ storage.Storage = (*Store)(nil)
