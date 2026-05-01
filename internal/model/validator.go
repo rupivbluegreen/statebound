@@ -2,6 +2,7 @@ package model
 
 import (
 	"fmt"
+	"strings"
 
 	"statebound.dev/statebound/internal/domain"
 )
@@ -249,6 +250,18 @@ func (v *validator) checkAuthorization(path string, auth YAMLAuthorization, scop
 		v.addf(path+".type", "invalid authorization type %q", auth.Type)
 	}
 
+	// Phase 6: light-weight model-side check for postgres.* sub-types
+	// before we hand off to the domain validator. Catches the
+	// most common authoring mistakes (missing database / role /
+	// privileges) with a clearer path than the synthetic-ID round-trip
+	// produces. The connector still does the deep validation against
+	// the live catalog at plan time.
+	if strings.HasPrefix(auth.Type, "postgres.") {
+		if findings := validatePostgresAuthorization(path, auth); len(findings) > 0 {
+			v.findings = append(v.findings, findings...)
+		}
+	}
+
 	hasScope := auth.Scope != ""
 	hasGlobal := auth.GlobalObject != ""
 	switch {
@@ -345,6 +358,117 @@ func globalObjectNames(objs []YAMLGlobalObject) []string {
 func isValidEnvName(s string) bool {
 	switch domain.Environment(s) {
 	case domain.EnvDev, domain.EnvStaging, domain.EnvProd:
+		return true
+	}
+	return false
+}
+
+// validatePostgresAuthorization runs the model-side checks for the
+// postgres.* authorization sub-types. Findings target the Body/Spec
+// catch-all map of YAMLAuthorization (the unified inline body for
+// Phase 6+ connector-specific keys). The connector does the deep
+// validation against the live catalog at plan time; this function
+// catches the most common authoring mistakes early.
+//
+// Sub-types handled:
+//   - postgres.grant: requires database (string), privileges
+//     (non-empty []string), and either schema+objects (any shape) or
+//     a top-level objects pattern.
+//   - postgres.role: requires database (string) and role (string).
+//
+// Unknown postgres.* sub-types produce one finding.
+func validatePostgresAuthorization(path string, auth YAMLAuthorization) []ValidationError {
+	body := auth.Body()
+	switch auth.Type {
+	case string(domain.AuthTypePostgresGrant):
+		var findings []ValidationError
+		if !hasNonEmptyString(body, "database") {
+			findings = append(findings, ValidationError{
+				Path:    path + ".database",
+				Message: "is required for postgres.grant",
+			})
+		}
+		if !hasNonEmptyStringSlice(body, "privileges") {
+			findings = append(findings, ValidationError{
+				Path:    path + ".privileges",
+				Message: "must be a non-empty list of strings",
+			})
+		}
+		// Either a top-level objects pattern, or schema + objects (in
+		// any shape) covers the grant target.
+		_, hasObjects := body["objects"]
+		_, hasSchema := body["schema"]
+		if !hasObjects && !hasSchema {
+			findings = append(findings, ValidationError{
+				Path:    path,
+				Message: "postgres.grant requires schema+objects or a top-level objects pattern",
+			})
+		}
+		return findings
+	case string(domain.AuthTypePostgresRole):
+		var findings []ValidationError
+		if !hasNonEmptyString(body, "database") {
+			findings = append(findings, ValidationError{
+				Path:    path + ".database",
+				Message: "is required for postgres.role",
+			})
+		}
+		if !hasNonEmptyString(body, "role") {
+			findings = append(findings, ValidationError{
+				Path:    path + ".role",
+				Message: "is required for postgres.role",
+			})
+		}
+		return findings
+	default:
+		// Caller restricts this dispatch to postgres.* prefixed types.
+		// The only way we land here is a postgres.* sub-type that the
+		// domain enum does not recognise. checkAuthorization already
+		// flags the invalid type itself; emit a more specific message
+		// pointing at the postgres.* dispatch so authors know which
+		// sub-types are supported.
+		return []ValidationError{{
+			Path:    path + ".type",
+			Message: fmt.Sprintf("unknown postgres authorization sub-type %q (supported: postgres.grant, postgres.role)", auth.Type),
+		}}
+	}
+}
+
+// hasNonEmptyString reports whether body[key] is a non-empty string.
+func hasNonEmptyString(body map[string]any, key string) bool {
+	if body == nil {
+		return false
+	}
+	raw, ok := body[key]
+	if !ok || raw == nil {
+		return false
+	}
+	s, ok := raw.(string)
+	return ok && s != ""
+}
+
+// hasNonEmptyStringSlice reports whether body[key] is a non-empty
+// []string-shaped value (accepts []any of strings or []string).
+func hasNonEmptyStringSlice(body map[string]any, key string) bool {
+	if body == nil {
+		return false
+	}
+	raw, ok := body[key]
+	if !ok || raw == nil {
+		return false
+	}
+	switch v := raw.(type) {
+	case []string:
+		return len(v) > 0
+	case []any:
+		if len(v) == 0 {
+			return false
+		}
+		for _, item := range v {
+			if _, ok := item.(string); !ok {
+				return false
+			}
+		}
 		return true
 	}
 	return false

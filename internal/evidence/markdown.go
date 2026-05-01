@@ -176,6 +176,37 @@ func renderMarkdownBody(c *PackContent) (string, error) {
 		}
 	}
 
+	// Apply records (Phase 6). Skip the section entirely when no
+	// records exist so older evidence packs render unchanged.
+	if len(c.ApplyRecords) > 0 {
+		b.WriteString("## Apply records\n\n")
+		for _, rec := range c.ApplyRecords {
+			fmt.Fprintf(&b, "### plan %s @ %s — %s%s\n\n",
+				rec.PlanID,
+				rec.StartedAt.UTC().Format(time.RFC3339Nano),
+				rec.State,
+				dryRunSuffix(rec.DryRun),
+			)
+			fmt.Fprintf(&b, "- Apply id: %s\n", rec.ID)
+			fmt.Fprintf(&b, "- Target: %s\n", rec.Target)
+			fmt.Fprintf(&b, "- Items: %d applied", rec.AppliedItems)
+			if rec.FailedItems > 0 {
+				fmt.Fprintf(&b, ", %d failed", rec.FailedItems)
+			}
+			b.WriteString("\n")
+			if rec.SummaryHash != "" {
+				fmt.Fprintf(&b, "- Summary hash: %s\n", rec.SummaryHash)
+			}
+			if rec.FinishedAt != nil {
+				fmt.Fprintf(&b, "- Finished at: %s\n", rec.FinishedAt.UTC().Format(time.RFC3339Nano))
+			}
+			if rec.FailureMessage != "" {
+				fmt.Fprintf(&b, "- Failure: %s\n", escapeCell(rec.FailureMessage))
+			}
+			b.WriteString("\n")
+		}
+	}
+
 	// Audit events
 	b.WriteString("## Audit events\n\n")
 	if len(c.AuditEvents) == 0 {
@@ -376,6 +407,16 @@ func renderDriftSeverityCounts(findings []DriftFindingRef) string {
 		parts = append(parts, fmt.Sprintf("%d %s", counts[sev], sev))
 	}
 	return strings.Join(parts, ", ")
+}
+
+// dryRunSuffix annotates an apply heading with " (dry-run)" when the
+// record was a dry-run. Returns the empty string for real applies so
+// the heading reads cleanly.
+func dryRunSuffix(dryRun bool) string {
+	if dryRun {
+		return " (dry-run)"
+	}
+	return ""
 }
 
 // shortHash returns the first 12 hex characters of h, or "—" if h is empty.

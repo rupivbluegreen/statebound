@@ -158,11 +158,30 @@ type YAMLGlobalObject struct {
 // YAMLAuthorization is a single permission entry. Type, Scope, and
 // GlobalObject are reserved keys; every other key is captured into Spec so
 // type-specific fields (methods, asUser, commands, group, ...) can sit inline.
+//
+// Spec doubles as the inline "body" map for connector-specific keys.
+// Phase 6 added Postgres authorization types (postgres.grant,
+// postgres.role) whose fields (database, schema, privileges, role,
+// login, objects, ...) land here verbatim. The custom UnmarshalYAML
+// below absorbs any non-reserved key into Spec, so YAML authors can
+// keep type-specific fields at the top level of an authorization
+// without nesting them under a separate "body:" key. Connectors and
+// the per-type validators read straight from Spec; see
+// validatePostgresAuthorization for an example.
 type YAMLAuthorization struct {
 	Type         string
 	Scope        string
 	GlobalObject string
 	Spec         map[string]any
+}
+
+// Body returns the connector-specific catch-all map for this
+// authorization, which is the same backing map as Spec. This is a
+// readability alias used by the Postgres validators (and any future
+// connector validators) that prefer "body" over "spec" terminology.
+// Returns nil if the authorization has no inline keys.
+func (a YAMLAuthorization) Body() map[string]any {
+	return a.Spec
 }
 
 // MarshalYAML re-emits the authorization as a flat mapping. Reserved keys

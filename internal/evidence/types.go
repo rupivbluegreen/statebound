@@ -51,6 +51,13 @@ type PackContent struct {
 	// still hash differently, but that is a one-time forward jump aligned
 	// with the v0.5 release.
 	DriftScans []DriftScanRef `json:"drift_scans"`
+	// ApplyRecords collects every connector apply (real and dry-run)
+	// against a plan that targets this approved version. Phase 6 adds
+	// this slice; the field is always emitted (an empty slice when no
+	// applies exist) so the wire shape is stable for downstream tooling.
+	// Records are sorted by StartedAt ascending so two builds emit
+	// byte-identical bytes regardless of storage ordering choices.
+	ApplyRecords []ApplyRecordRef `json:"apply_records"`
 }
 
 // ProductRef is the Product subset preserved in an evidence pack.
@@ -173,6 +180,27 @@ type DriftScanRef struct {
 	SummaryHash      string            `json:"summary_hash"`
 	FindingCount     int               `json:"finding_count"`
 	Findings         []DriftFindingRef `json:"findings"`
+}
+
+// ApplyRecordRef preserves one connector apply attempt against a plan
+// for this pack's approved version. Phase 6 adds this ref so the
+// auditor can replay every Apply (dry-run or real) that was performed.
+// Output is the canonical per-item result blob from
+// PlanApplyRecord.Output, pre-canonicalised by the builder so two
+// builds of the same record emit byte-identical bytes.
+type ApplyRecordRef struct {
+	ID             domain.ID       `json:"id"`
+	PlanID         domain.ID       `json:"plan_id"`
+	State          string          `json:"state"`
+	DryRun         bool            `json:"dry_run"`
+	Target         string          `json:"target"`
+	StartedAt      time.Time       `json:"started_at"`
+	FinishedAt     *time.Time      `json:"finished_at,omitempty"`
+	AppliedItems   int             `json:"applied_items"`
+	FailedItems    int             `json:"failed_items"`
+	SummaryHash    string          `json:"summary_hash"`
+	FailureMessage string          `json:"failure_message,omitempty"`
+	Output         json.RawMessage `json:"output,omitempty"`
 }
 
 // DriftFindingRef preserves one mismatch reported by a DriftScan. Bodies

@@ -3193,5 +3193,249 @@ func scanDriftFinding(r scannable) (*domain.DriftFinding, error) {
 	return f, nil
 }
 
+// -------- Plan apply records --------
+
+const planApplyColumns = "id, plan_id, state, started_at, finished_at, " +
+	"actor_kind, actor_subject, target, dry_run, applied_items, failed_items, " +
+	"failure_message, summary_hash, output"
+
+// validPlanApplyStates mirrors the CHECK constraint in
+// migrations/0008_plan_apply.sql.
+var validPlanApplyStates = map[string]struct{}{
+	"running":   {},
+	"succeeded": {},
+	"failed":    {},
+}
+
+// AppendPlanApplyRecord inserts a freshly-created plan_apply_records row
+// (typically in 'running' state). FK violations on plan_id surface as
+// ErrNotFound so callers can distinguish a stale plan reference from a
+// transient failure.
+func (s *Store) AppendPlanApplyRecord(ctx context.Context, rec *domain.PlanApplyRecord) error {
+	if rec == nil {
+		return storage.ErrInvalidArgument
+	}
+	if rec.ID == "" {
+		return fmt.Errorf("%w: plan apply record id", storage.ErrInvalidArgument)
+	}
+	if rec.PlanID == "" {
+		return fmt.Errorf("%w: plan apply record plan id", storage.ErrInvalidArgument)
+	}
+	if _, ok := validPlanApplyStates[string(rec.State)]; !ok {
+		return fmt.Errorf("%w: plan apply state %q", storage.ErrInvalidArgument, rec.State)
+	}
+	if rec.Target == "" {
+		return fmt.Errorf("%w: plan apply target", storage.ErrInvalidArgument)
+	}
+	if rec.AppliedItems < 0 {
+		return fmt.Errorf("%w: plan apply applied items", storage.ErrInvalidArgument)
+	}
+	if rec.FailedItems < 0 {
+		return fmt.Errorf("%w: plan apply failed items", storage.ErrInvalidArgument)
+	}
+	if err := rec.Actor.Validate(); err != nil {
+		return fmt.Errorf("%w: %v", storage.ErrInvalidArgument, err)
+	}
+	if rec.StartedAt.IsZero() {
+		rec.StartedAt = time.Now().UTC()
+	}
+
+	const q = `
+INSERT INTO plan_apply_records (
+  id, plan_id, state, started_at, finished_at, actor_kind, actor_subject,
+  target, dry_run, applied_items, failed_items, failure_message,
+  summary_hash, output
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14::jsonb)
+`
+	var finishedAt any
+	if rec.FinishedAt != nil {
+		finishedAt = *rec.FinishedAt
+	}
+	output := jsonOrNullObject(rec.Output)
+
+	_, err := s.q.Exec(ctx, q,
+		string(rec.ID),
+		string(rec.PlanID),
+		string(rec.State),
+		rec.StartedAt,
+		finishedAt,
+		string(rec.Actor.Kind),
+		rec.Actor.Subject,
+		rec.Target,
+		rec.DryRun,
+		rec.AppliedItems,
+		rec.FailedItems,
+		rec.FailureMessage,
+		rec.SummaryHash,
+		output,
+	)
+	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) {
+			switch pgErr.Code {
+			case pgUniqueViolation:
+				return storage.ErrAlreadyExists
+			case pgForeignKeyViolation:
+				return fmt.Errorf("%w: %s", storage.ErrNotFound, pgErr.ConstraintName)
+			case pgCheckViolation:
+				return fmt.Errorf("%w: %s", storage.ErrInvalidArgument, pgErr.ConstraintName)
+			}
+		}
+		return fmt.Errorf("postgres: insert plan_apply_record: %w", err)
+	}
+	return nil
+}
+
+// UpdatePlanApplyRecord rewrites the mutable columns of an existing
+// record (state, finished_at, applied_items, failed_items,
+// failure_message, summary_hash, output). Identity columns (plan_id,
+// started_at, actor, target, dry_run) are not touched. Returns
+// ErrPlanApplyRecordNotFound if no row matches id.
+func (s *Store) UpdatePlanApplyRecord(ctx context.Context, rec *domain.PlanApplyRecord) error {
+	if rec == nil {
+		return storage.ErrInvalidArgument
+	}
+	if rec.ID == "" {
+		return fmt.Errorf("%w: plan apply record id", storage.ErrInvalidArgument)
+	}
+	if _, ok := validPlanApplyStates[string(rec.State)]; !ok {
+		return fmt.Errorf("%w: plan apply state %q", storage.ErrInvalidArgument, rec.State)
+	}
+	if rec.AppliedItems < 0 {
+		return fmt.Errorf("%w: plan apply applied items", storage.ErrInvalidArgument)
+	}
+	if rec.FailedItems < 0 {
+		return fmt.Errorf("%w: plan apply failed items", storage.ErrInvalidArgument)
+	}
+
+	const q = `
+UPDATE plan_apply_records
+   SET state           = $2,
+       finished_at     = $3,
+       applied_items   = $4,
+       failed_items    = $5,
+       failure_message = $6,
+       summary_hash    = $7,
+       output          = $8::jsonb
+ WHERE id = $1
+`
+	var finishedAt any
+	if rec.FinishedAt != nil {
+		finishedAt = *rec.FinishedAt
+	}
+	output := jsonOrNullObject(rec.Output)
+
+	tag, err := s.q.Exec(ctx, q,
+		string(rec.ID),
+		string(rec.State),
+		finishedAt,
+		rec.AppliedItems,
+		rec.FailedItems,
+		rec.FailureMessage,
+		rec.SummaryHash,
+		output,
+	)
+	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) {
+			switch pgErr.Code {
+			case pgCheckViolation:
+				return fmt.Errorf("%w: %s", storage.ErrInvalidArgument, pgErr.ConstraintName)
+			}
+		}
+		return fmt.Errorf("postgres: update plan_apply_record: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return storage.ErrPlanApplyRecordNotFound
+	}
+	return nil
+}
+
+// GetPlanApplyRecordByID returns a single record by id, or
+// ErrPlanApplyRecordNotFound if absent.
+func (s *Store) GetPlanApplyRecordByID(ctx context.Context, id domain.ID) (*domain.PlanApplyRecord, error) {
+	if id == "" {
+		return nil, storage.ErrInvalidArgument
+	}
+	q := `SELECT ` + planApplyColumns + ` FROM plan_apply_records WHERE id = $1`
+	rec, err := scanPlanApplyRecord(s.q.QueryRow(ctx, q, string(id)))
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			return nil, storage.ErrPlanApplyRecordNotFound
+		}
+		return nil, err
+	}
+	return rec, nil
+}
+
+// ListPlanApplyRecordsByPlan returns every record for planID, newest
+// first by started_at. An empty slice (not an error) is returned when
+// no record exists.
+func (s *Store) ListPlanApplyRecordsByPlan(ctx context.Context, planID domain.ID) ([]*domain.PlanApplyRecord, error) {
+	if planID == "" {
+		return nil, storage.ErrInvalidArgument
+	}
+	q := `SELECT ` + planApplyColumns + ` FROM plan_apply_records WHERE plan_id = $1 ORDER BY started_at DESC, id ASC`
+	rows, err := s.q.Query(ctx, q, string(planID))
+	if err != nil {
+		return nil, fmt.Errorf("postgres: list plan_apply_records: %w", err)
+	}
+	defer rows.Close()
+	out := make([]*domain.PlanApplyRecord, 0)
+	for rows.Next() {
+		rec, err := scanPlanApplyRecord(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, rec)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("postgres: iterate plan_apply_records: %w", err)
+	}
+	return out, nil
+}
+
+func scanPlanApplyRecord(r scannable) (*domain.PlanApplyRecord, error) {
+	var (
+		id, planID, state                         string
+		startedAt                                 time.Time
+		finishedAt                                *time.Time
+		actorKind, actorSubject, target           string
+		dryRun                                    bool
+		appliedItems, failedItems                 int
+		failureMessage, summaryHash               string
+		outputRaw                                 []byte
+	)
+	err := r.Scan(
+		&id, &planID, &state, &startedAt, &finishedAt,
+		&actorKind, &actorSubject, &target, &dryRun,
+		&appliedItems, &failedItems, &failureMessage, &summaryHash, &outputRaw,
+	)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, storage.ErrNotFound
+		}
+		return nil, fmt.Errorf("postgres: scan plan_apply_record: %w", err)
+	}
+	rec := &domain.PlanApplyRecord{
+		ID:             domain.ID(id),
+		PlanID:         domain.ID(planID),
+		State:          domain.PlanApplyState(state),
+		StartedAt:      startedAt,
+		FinishedAt:     finishedAt,
+		Actor:          domain.Actor{Kind: domain.ActorKind(actorKind), Subject: actorSubject},
+		Target:         target,
+		DryRun:         dryRun,
+		AppliedItems:   appliedItems,
+		FailedItems:    failedItems,
+		FailureMessage: failureMessage,
+		SummaryHash:    summaryHash,
+	}
+	if len(outputRaw) > 0 {
+		rec.Output = json.RawMessage(append([]byte(nil), outputRaw...))
+	}
+	return rec, nil
+}
+
 // Compile-time assertion that *Store satisfies storage.Storage.
 var _ storage.Storage = (*Store)(nil)

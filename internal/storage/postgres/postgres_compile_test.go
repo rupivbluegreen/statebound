@@ -31,6 +31,7 @@ func TestStoreSubInterfaces(t *testing.T) {
 		_ storage.PolicyDecisionStore  = (*postgres.Store)(nil)
 		_ storage.EvidencePackStore    = (*postgres.Store)(nil)
 		_ storage.PlanStore            = (*postgres.Store)(nil)
+		_ storage.PlanApplyStore       = (*postgres.Store)(nil)
 		_ storage.DriftStore           = (*postgres.Store)(nil)
 	)
 	_ = t

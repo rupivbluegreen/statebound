@@ -30,7 +30,14 @@ const (
 // fragments off disk) and Compare (diff observed bytes against the
 // approved-state plan). All operations are pure file IO — the
 // connector never executes sudo, ssh, or any shell command.
-type Connector struct{}
+//
+// Phase 6 introduced the Apply method on the connector contract;
+// linux-sudo remains plan-and-drift only (Postgres is the first
+// connector to implement Apply), so UnsupportedApply is embedded to
+// keep the type minimal and explicit about the capability gap.
+type Connector struct {
+	connectors.UnsupportedApply
+}
 
 // New returns a fresh Connector. Stateless; safe to share.
 func New() *Connector { return &Connector{} }

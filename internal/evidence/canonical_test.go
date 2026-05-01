@@ -146,6 +146,8 @@ func fixedPack(t *testing.T) *PackContent {
 		// stable for downstream tooling that expects the field to always
 		// be present.
 		DriftScans: []DriftScanRef{},
+		// Phase 6 adds ApplyRecords; same wire-shape rule applies.
+		ApplyRecords: []ApplyRecordRef{},
 	}
 	return pack
 }
@@ -269,4 +271,3 @@ func TestEncodeJSON_RawMessageNullsRoundTrip(t *testing.T) {
 		t.Fatalf("before should be omitted when nil, got %s", out)
 	}
 }
-

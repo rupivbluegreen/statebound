@@ -117,8 +117,79 @@ type ActualStateItem struct {
 	Body map[string]any
 }
 
-// ApplyResult is a placeholder for Phase 6 (apply lands in core v0.6+).
-type ApplyResult struct{}
+// ApplyResult is what Connector.Apply() returns. The CLI/service
+// layer promotes a Plan to its Applied/Failed terminal state by
+// inspecting Items: if every item has Status == "applied" or
+// Status == "skipped" the apply is a success; any "failed" item
+// flips the parent record (and the parent Plan) to Failed.
+//
+// SummaryHash is the SHA-256 hex of the canonical JSON of Items so
+// re-applying byte-equal item results against the same target
+// produces the same hash. Connectors are responsible for canonical
+// ordering of Items (sequence-ascending) before computing the hash.
+type ApplyResult struct {
+	ConnectorName    string
+	ConnectorVersion string
+	// Target mirrors PlanApplyRecord.Target — a free-form
+	// connector-specific identifier (e.g. "postgres://host:5432/db").
+	Target      string
+	StartedAt   time.Time
+	FinishedAt  time.Time
+	DryRun      bool
+	Items       []ApplyItemResult
+	SummaryHash string
+}
+
+// ApplyItemResult is one row in ApplyResult.Items. The 1:1 mapping
+// with the parent Plan's PlanItems is preserved by Sequence; the CLI
+// joins back through ResourceKind/ResourceRef so an item that the
+// connector skipped (Status="skipped") still lines up with its
+// authoring intent.
+type ApplyItemResult struct {
+	Sequence     int
+	ResourceKind string
+	ResourceRef  string
+	// Status is one of "applied" | "skipped" | "failed". "skipped"
+	// covers idempotent no-ops (e.g. GRANT already in place).
+	Status string
+	// Statements is the list of SQL/shell/connector-native commands
+	// the connector executed (or would execute under DryRun=true).
+	// Empty list is legal for skipped items.
+	Statements []string
+	// RowsAffected is the connector's row count, or -1 when not
+	// applicable (e.g. plan-only fragments).
+	RowsAffected int
+	// Error is populated only when Status == "failed".
+	Error string
+}
+
+// PlanForApply is what Apply() consumes. The CLI loads the plan and
+// its items from storage and converts them to this shape so
+// connectors do not need to depend on the storage interface or on
+// domain types beyond the canonical wire representation.
+type PlanForApply struct {
+	PlanID            string
+	ProductID         string
+	ApprovedVersionID string
+	Sequence          int64
+	ConnectorName     string
+	ConnectorVersion  string
+	Items             []PlanItem
+}
+
+// ApplyOptions are the connector-tuneable apply knobs. DryRun=true
+// means: produce the same Items output (with Statements populated)
+// but do not mutate the target system. The parent PlanApplyRecord
+// will still land in a terminal state but the connector must not
+// report Status="applied" for items that were not actually applied;
+// dry-run rows use Status="skipped" with Statements populated so
+// the auditor can see what would have happened.
+type ApplyOptions struct {
+	DryRun bool
+	// Target is the connector-specific destination identifier
+	// (e.g. a Postgres DSN). Connectors validate this on entry.
+	Target string
+}
 
 // DriftFinding is a connector-side finding. The CLI/service layer
 // translates these into domain.DriftFinding rows for persistence.
@@ -196,6 +267,20 @@ type Connector interface {
 	// findings in identical order. Connectors that do not implement
 	// comparison return ErrCapabilityNotSupported.
 	Compare(ctx context.Context, desired ApprovedState, actual *ActualState) ([]DriftFinding, error)
+
+	// Apply executes plan against the connector's target system. The
+	// CLI/service layer pre-checks that the Plan is in PlanStateReady
+	// and that the parent ApprovedVersion has not been superseded;
+	// connectors do not re-validate that contract. Connectors that do
+	// not implement apply return ErrCapabilityNotSupported (typically
+	// by embedding UnsupportedApply).
+	//
+	// Apply must not mutate the target system when opts.DryRun is
+	// true. In dry-run mode the connector returns the same shape of
+	// ApplyResult it would otherwise produce, with Status="skipped"
+	// for every item and Statements populated so the auditor can see
+	// the intended commands.
+	Apply(ctx context.Context, plan *PlanForApply, opts ApplyOptions) (*ApplyResult, error)
 }
 
 // UnsupportedCollectAndCompare is a default implementation of the
@@ -220,6 +305,25 @@ func (UnsupportedCollectAndCompare) CollectActualState(context.Context, Collecti
 
 // Compare always returns ErrCapabilityNotSupported.
 func (UnsupportedCollectAndCompare) Compare(context.Context, ApprovedState, *ActualState) ([]DriftFinding, error) {
+	return nil, ErrCapabilityNotSupported
+}
+
+// UnsupportedApply is a default implementation of Apply. Connectors
+// without apply support embed this type to keep their struct minimal:
+//
+//	type Connector struct {
+//	    connectors.UnsupportedApply
+//	    // ... rest of state
+//	}
+//
+// Apply always returns ErrCapabilityNotSupported. Such connectors must
+// also leave CapabilityApply out of their Capabilities() return value
+// so callers can dispatch on capabilities instead of probing for the
+// error.
+type UnsupportedApply struct{}
+
+// Apply always returns ErrCapabilityNotSupported.
+func (UnsupportedApply) Apply(context.Context, *PlanForApply, ApplyOptions) (*ApplyResult, error) {
 	return nil, ErrCapabilityNotSupported
 }
 

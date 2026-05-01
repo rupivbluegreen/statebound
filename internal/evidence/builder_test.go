@@ -16,32 +16,36 @@ import (
 // fakeStore is a tiny in-memory BuilderStore for the deterministic-build
 // tests. Each field is hand-populated by the test fixture below.
 type fakeStore struct {
-	products         map[domain.ID]*domain.Product
-	versions         map[domain.ID]*domain.ApprovedVersion
-	snapshots        map[domain.ID]*domain.ApprovedVersionSnapshot
-	versionsByProd   map[domain.ID][]*domain.ApprovedVersion
-	changeSets       map[domain.ID]*domain.ChangeSet
-	itemsByCS        map[domain.ID][]*domain.ChangeSetItem
-	approvalsByCS    map[domain.ID][]*domain.Approval
-	decisionsByCS    map[domain.ID][]*storage.PolicyDecisionRecord
-	auditByResource  map[string][]*domain.AuditEvent // key = resourceType + "|" + resourceID
-	driftScansByProd map[domain.ID][]*domain.DriftScan
-	driftFindings    map[domain.ID][]*domain.DriftFinding // key = scanID
+	products           map[domain.ID]*domain.Product
+	versions           map[domain.ID]*domain.ApprovedVersion
+	snapshots          map[domain.ID]*domain.ApprovedVersionSnapshot
+	versionsByProd     map[domain.ID][]*domain.ApprovedVersion
+	changeSets         map[domain.ID]*domain.ChangeSet
+	itemsByCS          map[domain.ID][]*domain.ChangeSetItem
+	approvalsByCS      map[domain.ID][]*domain.Approval
+	decisionsByCS      map[domain.ID][]*storage.PolicyDecisionRecord
+	auditByResource    map[string][]*domain.AuditEvent // key = resourceType + "|" + resourceID
+	driftScansByProd   map[domain.ID][]*domain.DriftScan
+	driftFindings      map[domain.ID][]*domain.DriftFinding // key = scanID
+	plansByAV          map[domain.ID][]*domain.Plan         // key = approvedVersionID
+	applyRecordsByPlan map[domain.ID][]*domain.PlanApplyRecord
 }
 
 func newFakeStore() *fakeStore {
 	return &fakeStore{
-		products:         map[domain.ID]*domain.Product{},
-		versions:         map[domain.ID]*domain.ApprovedVersion{},
-		snapshots:        map[domain.ID]*domain.ApprovedVersionSnapshot{},
-		versionsByProd:   map[domain.ID][]*domain.ApprovedVersion{},
-		changeSets:       map[domain.ID]*domain.ChangeSet{},
-		itemsByCS:        map[domain.ID][]*domain.ChangeSetItem{},
-		approvalsByCS:    map[domain.ID][]*domain.Approval{},
-		decisionsByCS:    map[domain.ID][]*storage.PolicyDecisionRecord{},
-		auditByResource:  map[string][]*domain.AuditEvent{},
-		driftScansByProd: map[domain.ID][]*domain.DriftScan{},
-		driftFindings:    map[domain.ID][]*domain.DriftFinding{},
+		products:           map[domain.ID]*domain.Product{},
+		versions:           map[domain.ID]*domain.ApprovedVersion{},
+		snapshots:          map[domain.ID]*domain.ApprovedVersionSnapshot{},
+		versionsByProd:     map[domain.ID][]*domain.ApprovedVersion{},
+		changeSets:         map[domain.ID]*domain.ChangeSet{},
+		itemsByCS:          map[domain.ID][]*domain.ChangeSetItem{},
+		approvalsByCS:      map[domain.ID][]*domain.Approval{},
+		decisionsByCS:      map[domain.ID][]*storage.PolicyDecisionRecord{},
+		auditByResource:    map[string][]*domain.AuditEvent{},
+		driftScansByProd:   map[domain.ID][]*domain.DriftScan{},
+		driftFindings:      map[domain.ID][]*domain.DriftFinding{},
+		plansByAV:          map[domain.ID][]*domain.Plan{},
+		applyRecordsByPlan: map[domain.ID][]*domain.PlanApplyRecord{},
 	}
 }
 
@@ -134,6 +138,18 @@ func (s *fakeStore) GetDriftScanByID(_ context.Context, id domain.ID) (*domain.D
 		}
 	}
 	return nil, nil, storage.ErrDriftScanNotFound
+}
+
+func (s *fakeStore) ListPlansByApprovedVersion(_ context.Context, approvedVersionID domain.ID) ([]*domain.Plan, error) {
+	out := make([]*domain.Plan, 0, len(s.plansByAV[approvedVersionID]))
+	out = append(out, s.plansByAV[approvedVersionID]...)
+	return out, nil
+}
+
+func (s *fakeStore) ListPlanApplyRecordsByPlan(_ context.Context, planID domain.ID) ([]*domain.PlanApplyRecord, error) {
+	out := make([]*domain.PlanApplyRecord, 0, len(s.applyRecordsByPlan[planID]))
+	out = append(out, s.applyRecordsByPlan[planID]...)
+	return out, nil
 }
 
 // fixedFixture builds a deterministic fakeStore plus the ids needed to
@@ -572,6 +588,117 @@ func TestBuilder_DriftScansPopulated(t *testing.T) {
 	}
 	if !bytes.Equal(first, second) {
 		t.Fatalf("pack with drift scans not byte-identical across builds:\nfirst=%s\nsecond=%s", first, second)
+	}
+}
+
+// TestBuilder_ApplyRecordsEmptyByDefault asserts that a fixture with no
+// plans/applies yields an empty (not nil) ApplyRecords slice. The wire
+// shape promise depends on this — downstream tooling expects the field
+// to be present.
+func TestBuilder_ApplyRecordsEmptyByDefault(t *testing.T) {
+	store, productID, _, _ := fixedFixture(t)
+	b := NewBuilder(store).WithClock(fixedClock())
+	pack, err := b.BuildLatest(context.Background(), productID)
+	if err != nil {
+		t.Fatalf("BuildLatest: %v", err)
+	}
+	if got, want := len(pack.ApplyRecords), 0; got != want {
+		t.Errorf("len(ApplyRecords) = %d, want %d", got, want)
+	}
+	if pack.ApplyRecords == nil {
+		t.Errorf("ApplyRecords should be a non-nil empty slice; got nil")
+	}
+}
+
+// TestBuilder_ApplyRecordsPopulated stages a plan + apply record against
+// the fixture's approved version and asserts both appear in the pack
+// (sorted by StartedAt asc) with the canonical Output blob preserved.
+func TestBuilder_ApplyRecordsPopulated(t *testing.T) {
+	store, productID, avID, _ := fixedFixture(t)
+
+	planID := domain.ID("00000000-0000-0000-0000-000000000aa1")
+	applyID1 := domain.ID("00000000-0000-0000-0000-000000000ab1")
+	applyID2 := domain.ID("00000000-0000-0000-0000-000000000ab2")
+	startedAt1 := time.Date(2026, 5, 1, 12, 10, 0, 0, time.UTC)
+	startedAt2 := time.Date(2026, 5, 1, 12, 20, 0, 0, time.UTC)
+	finishedAt1 := startedAt1.Add(time.Second)
+	finishedAt2 := startedAt2.Add(time.Second)
+
+	plan := &domain.Plan{
+		ID:                planID,
+		ProductID:         productID,
+		ApprovedVersionID: avID,
+		Sequence:          1,
+		ConnectorName:     "postgres",
+		ConnectorVersion:  "0.6.0",
+		State:             domain.PlanStateApplied,
+	}
+	store.plansByAV[avID] = []*domain.Plan{plan}
+
+	// Two apply records: a dry-run that succeeded, and a real apply that
+	// also succeeded (newer). Insert in reverse-time order to verify the
+	// builder sorts by StartedAt asc.
+	store.applyRecordsByPlan[planID] = []*domain.PlanApplyRecord{
+		{
+			ID:           applyID2,
+			PlanID:       planID,
+			State:        domain.PlanApplyStateSucceeded,
+			StartedAt:    startedAt2,
+			FinishedAt:   &finishedAt2,
+			Actor:        domain.Actor{Kind: domain.ActorHuman, Subject: "alice@example.com"},
+			Target:       "postgres://example/payments",
+			DryRun:       false,
+			AppliedItems: 2,
+			SummaryHash:  "sha256:0011",
+			Output:       json.RawMessage(`{"items":[{"sequence":1,"status":"applied"}]}`),
+		},
+		{
+			ID:           applyID1,
+			PlanID:       planID,
+			State:        domain.PlanApplyStateSucceeded,
+			StartedAt:    startedAt1,
+			FinishedAt:   &finishedAt1,
+			Actor:        domain.Actor{Kind: domain.ActorHuman, Subject: "alice@example.com"},
+			Target:       "postgres://example/payments",
+			DryRun:       true,
+			AppliedItems: 2,
+			SummaryHash:  "sha256:0010",
+			Output:       json.RawMessage(`{"items":[{"sequence":1,"status":"skipped"}]}`),
+		},
+	}
+
+	b := NewBuilder(store).WithClock(fixedClock())
+	pack, err := b.BuildLatest(context.Background(), productID)
+	if err != nil {
+		t.Fatalf("BuildLatest: %v", err)
+	}
+	if got, want := len(pack.ApplyRecords), 2; got != want {
+		t.Fatalf("len(ApplyRecords) = %d, want %d", got, want)
+	}
+	if pack.ApplyRecords[0].ID != applyID1 {
+		t.Errorf("ApplyRecords[0].ID = %s, want %s (sort by StartedAt asc)", pack.ApplyRecords[0].ID, applyID1)
+	}
+	if pack.ApplyRecords[0].DryRun != true {
+		t.Errorf("ApplyRecords[0].DryRun = %v, want true", pack.ApplyRecords[0].DryRun)
+	}
+	if pack.ApplyRecords[1].DryRun != false {
+		t.Errorf("ApplyRecords[1].DryRun = %v, want false", pack.ApplyRecords[1].DryRun)
+	}
+	// Reproducibility: two builds emit byte-identical bytes.
+	first, err := EncodeJSON(pack)
+	if err != nil {
+		t.Fatalf("EncodeJSON #1: %v", err)
+	}
+	pack2, err := b.BuildLatest(context.Background(), productID)
+	if err != nil {
+		t.Fatalf("BuildLatest #2: %v", err)
+	}
+	second, err := EncodeJSON(pack2)
+	if err != nil {
+		t.Fatalf("EncodeJSON #2: %v", err)
+	}
+	if !bytes.Equal(first, second) {
+		t.Fatalf("pack with apply records not byte-identical:\nfirst=%s\nsecond=%s", first, second)
 	}
 }
 

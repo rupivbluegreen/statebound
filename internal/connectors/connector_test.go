@@ -12,8 +12,11 @@ import (
 //
 // UnsupportedCollectAndCompare is embedded so fakeConnector satisfies
 // the Phase 4'+ interface without bothering with drift implementations.
+// UnsupportedApply was added in Phase 6 alongside the Apply method on
+// Connector.
 type fakeConnector struct {
 	UnsupportedCollectAndCompare
+	UnsupportedApply
 	name    string
 	version string
 	caps    []Capability

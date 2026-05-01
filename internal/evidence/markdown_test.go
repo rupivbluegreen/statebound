@@ -186,6 +186,71 @@ func TestExportMarkdown_DriftScansSectionWhenPopulated(t *testing.T) {
 	}
 }
 
+// TestExportMarkdown_ApplyRecordsSectionOmittedWhenEmpty asserts the
+// Apply records section is skipped entirely when the pack has no apply
+// records, so older (pre-Phase 6) evidence packs render unchanged.
+func TestExportMarkdown_ApplyRecordsSectionOmittedWhenEmpty(t *testing.T) {
+	pack := fixedPack(t)
+	out, err := ExportMarkdown(pack)
+	if err != nil {
+		t.Fatalf("ExportMarkdown: %v", err)
+	}
+	var env struct {
+		Body string `json:"body"`
+	}
+	if err := json.Unmarshal(out, &env); err != nil {
+		t.Fatalf("decode envelope: %v", err)
+	}
+	if strings.Contains(env.Body, "## Apply records") {
+		t.Errorf("Apply records section should be omitted when empty; body:\n%s", env.Body)
+	}
+}
+
+// TestExportMarkdown_ApplyRecordsSectionWhenPopulated stages an apply
+// record into the pack and asserts the rendered Markdown contains the
+// header, the target line, the dry-run annotation, and the apply id.
+func TestExportMarkdown_ApplyRecordsSectionWhenPopulated(t *testing.T) {
+	pack := fixedPack(t)
+	finishedAt := pack.GeneratedAt.Add(time.Minute)
+	pack.ApplyRecords = []ApplyRecordRef{
+		{
+			ID:           "00000000-0000-0000-0000-000000000ab1",
+			PlanID:       "00000000-0000-0000-0000-000000000aa1",
+			State:        "succeeded",
+			DryRun:       true,
+			Target:       "postgres://example/payments",
+			StartedAt:    pack.GeneratedAt,
+			FinishedAt:   &finishedAt,
+			AppliedItems: 2,
+			FailedItems:  0,
+			SummaryHash:  "sha256:abc",
+		},
+	}
+	out, err := ExportMarkdown(pack)
+	if err != nil {
+		t.Fatalf("ExportMarkdown: %v", err)
+	}
+	var env struct {
+		Body string `json:"body"`
+	}
+	if err := json.Unmarshal(out, &env); err != nil {
+		t.Fatalf("decode envelope: %v", err)
+	}
+	body := env.Body
+	for _, want := range []string{
+		"## Apply records",
+		"### plan 00000000-0000-0000-0000-000000000aa1",
+		"(dry-run)",
+		"- Target: postgres://example/payments",
+		"- Items: 2 applied",
+		"- Summary hash: sha256:abc",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("Apply records section missing %q; body:\n%s", want, body)
+		}
+	}
+}
+
 func min(a, b int) int {
 	if a < b {
 		return a

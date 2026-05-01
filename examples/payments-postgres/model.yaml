@@ -1,0 +1,49 @@
+apiVersion: statebound.dev/v1alpha1
+kind: ProductAuthorizationModel
+metadata:
+  product: payments-postgres
+  owner: platform-security
+  description: Payments database authorization governance
+spec:
+  assets:
+    - name: pay-postgres-01
+      type: postgres-database
+      environment: prod
+      labels:
+        database: payments
+        cluster: pay-pg-cluster
+
+  assetScopes:
+    - name: prod-postgres-payments
+      selector:
+        type: postgres-database
+        environment: prod
+        database: payments
+
+  entitlements:
+    - name: payments-readonly
+      owner: payments-team
+      purpose: Read-only production troubleshooting via Postgres
+      authorizations:
+        - type: postgres.grant
+          scope: prod-postgres-payments
+          database: payments
+          schema: public
+          privileges: [SELECT]
+          objects:
+            tables: [accounts, transactions]
+          as_role: payments_readonly
+
+  serviceAccounts:
+    - name: payments-batch
+      owner: payments-team
+      usagePattern: system-to-system
+      purpose: Settlement batch jobs read/write
+      authorizations:
+        - type: postgres.role
+          scope: prod-postgres-payments
+          database: payments
+          role: payments_batch
+          login: true
+          inherit: true
+          connection_limit: 10

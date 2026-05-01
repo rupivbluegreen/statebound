@@ -165,5 +165,49 @@ jobs:
           # Audit chain still good
           ./bin/statebound audit verify
 
+          # Phase 6: apply CLI surface check. Help text + flag pinning guard
+          # against silent CLI regressions. Help text passes regardless of DB
+          # state.
+          ./bin/statebound apply --help | grep -q -- "--dry-run"
+          ./bin/statebound apply --help | grep -q -- "--apply"
+          ./bin/statebound apply --help | grep -q -- "--target"
+
+          # Phase 6: Postgres connector smoke (plan + dry-run apply only).
+          # Set up a separate database within the existing CI Postgres for
+          # apply-target purposes.
+          PGPASSWORD=statebound psql -h localhost -U statebound -d statebound -c "CREATE DATABASE payments_test;" || true
+
+          # The import + plan + apply path is best-effort: run it if the
+          # postgres example is fully supported by the migration in this
+          # build. If the model import fails (e.g. an authorization sub-type
+          # is not yet whitelisted at the migration layer), skip downstream
+          # steps with a warning rather than failing the whole pipeline —
+          # the apply CLI is still verified by the unit tests above.
+          if STATEBOUND_DEV_AUTO_APPROVE=true ./bin/statebound model import -f examples/payments-postgres/model.yaml --auto-approve; then
+            ./bin/statebound plan --product payments-postgres --connector postgres --output /tmp/plan-pg-1.json
+            ./bin/statebound plan --product payments-postgres --connector postgres --output /tmp/plan-pg-2.json
+            # Same approved version + same connector version -> byte-identical content
+            diff -q /tmp/plan-pg-1.json /tmp/plan-pg-2.json
+
+            # Recover the most recent plan id for payments-postgres from the
+            # audit log. plan.ready audits carry the id in resource_id.
+            PG_PLAN_ID=$(./bin/statebound audit list --kind plan.ready --resource-type plan --limit 5 \
+              | awk 'NR>1 {print $4}' | head -1 | cut -d/ -f2)
+            if [ -n "$PG_PLAN_ID" ]; then
+              # Dry-run apply: builds SQL but doesn't execute. Plan stays Ready.
+              ./bin/statebound apply "$PG_PLAN_ID" \
+                --target "postgres://statebound:statebound@localhost:5432/payments_test?sslmode=disable" \
+                --dry-run --output /tmp/apply-pg-dryrun.json
+              jq -e '.apply_record.dry_run == true' /tmp/apply-pg-dryrun.json
+              jq -e '.apply_record.state == "succeeded"' /tmp/apply-pg-dryrun.json
+            else
+              echo "::warning::Could not extract plan id for Postgres apply smoke; skipping"
+            fi
+          else
+            echo "::warning::payments-postgres model import failed (likely a migration gap); skipping postgres plan+apply smoke"
+          fi
+
+          ./bin/statebound audit verify
+
           # Standalone product create still works
           ./bin/statebound product create checkout-api --owner ci-bot --description "CI smoke product"

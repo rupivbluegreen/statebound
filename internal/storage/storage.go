@@ -25,6 +25,10 @@ var (
 	ErrEvidencePackNotFound = errors.New("storage: evidence pack not found")
 	// ErrPlanNotFound is returned when a plans lookup misses.
 	ErrPlanNotFound = errors.New("storage: plan not found")
+	// ErrPlanApplyRecordNotFound is returned when a plan_apply_records lookup
+	// misses. Phase 6: introduced alongside the apply state machine so callers
+	// can distinguish "no apply for this plan" from a transient failure.
+	ErrPlanApplyRecordNotFound = errors.New("storage: plan apply record not found")
 	// ErrDriftScanNotFound is returned when a drift_scans lookup misses.
 	ErrDriftScanNotFound = errors.New("storage: drift scan not found")
 )
@@ -246,6 +250,27 @@ type PlanStore interface {
 	UpdatePlanState(ctx context.Context, id domain.ID, state domain.PlanState, reason string) error
 }
 
+// PlanApplyStore persists Plan apply executions.
+//
+// Phase 6 contract:
+//   - AppendPlanApplyRecord inserts a row in 'running' state.
+//   - UpdatePlanApplyRecord rewrites the mutable columns (state,
+//     finished_at, applied_items, failed_items, failure_message,
+//     summary_hash, output) on an existing id, typically to land it
+//     in a terminal state. Identity columns (plan_id, started_at,
+//     actor, target, dry_run) are not touched.
+//   - GetPlanApplyRecordByID returns a single record by id, or
+//     ErrPlanApplyRecordNotFound if absent.
+//   - ListPlanApplyRecordsByPlan returns every record for a plan,
+//     newest first by started_at. An empty slice (not an error) is
+//     returned when no record exists.
+type PlanApplyStore interface {
+	AppendPlanApplyRecord(ctx context.Context, rec *domain.PlanApplyRecord) error
+	UpdatePlanApplyRecord(ctx context.Context, rec *domain.PlanApplyRecord) error
+	GetPlanApplyRecordByID(ctx context.Context, id domain.ID) (*domain.PlanApplyRecord, error)
+	ListPlanApplyRecordsByPlan(ctx context.Context, planID domain.ID) ([]*domain.PlanApplyRecord, error)
+}
+
 // DriftStore persists connector-driven drift scans and their findings.
 //
 // A drift scan begins in 'running' state via AppendDriftScan, lands in
@@ -297,6 +322,7 @@ type Storage interface {
 	PolicyDecisionStore
 	EvidencePackStore
 	PlanStore
+	PlanApplyStore
 	DriftStore
 	Close(ctx context.Context) error
 	Ping(ctx context.Context) error

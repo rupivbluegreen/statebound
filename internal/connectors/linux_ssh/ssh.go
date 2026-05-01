@@ -28,8 +28,13 @@ const (
 // Phase 4'+ Connector interface (which gained CollectActualState and
 // Compare) without yet implementing drift detection. Both methods
 // return ErrCapabilityNotSupported.
+//
+// Phase 6 added Apply to the Connector contract; linux-ssh remains
+// plan-only (Postgres is the first connector to implement Apply), so
+// UnsupportedApply is embedded alongside.
 type Connector struct {
 	connectors.UnsupportedCollectAndCompare
+	connectors.UnsupportedApply
 }
 
 // New returns a fresh Connector. Stateless; safe to share.

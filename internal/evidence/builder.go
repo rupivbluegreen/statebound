@@ -39,6 +39,14 @@ type BuilderStore interface {
 	// GetDriftScanByID is used to load each filtered scan's findings; the
 	// list call returns scan metadata only.
 	GetDriftScanByID(ctx context.Context, id domain.ID) (*domain.DriftScan, []*domain.DriftFinding, error)
+	// ListPlansByApprovedVersion returns every plan generated against the
+	// pack's approved version. Phase 6 uses this to find plans whose
+	// apply records belong in the pack.
+	ListPlansByApprovedVersion(ctx context.Context, approvedVersionID domain.ID) ([]*domain.Plan, error)
+	// ListPlanApplyRecordsByPlan returns every apply attempt (dry-run or
+	// real) against planID, newest first. Phase 6 uses this to inline
+	// applies into the pack alongside the parent plan's drift scans.
+	ListPlanApplyRecordsByPlan(ctx context.Context, planID domain.ID) ([]*domain.PlanApplyRecord, error)
 }
 
 // Builder assembles a PackContent from the data layer. It is read-only
@@ -241,7 +249,92 @@ func (b *Builder) buildFor(
 		return nil, fmt.Errorf("evidence: collect drift scans: %w", err)
 	}
 
+	// 9. Apply records (Phase 6). Plans -> ApplyRecords is one-to-many.
+	//    We list every plan against the AV and collect the apply records
+	//    for each, then sort the merged result deterministically.
+	pack.ApplyRecords, err = b.collectApplyRecords(ctx, av)
+	if err != nil {
+		return nil, fmt.Errorf("evidence: collect apply records: %w", err)
+	}
+
 	return pack, nil
+}
+
+// collectApplyRecords gathers every PlanApplyRecord against any plan
+// targeting av's approved version. The result is ordered by StartedAt
+// asc (then ID asc) so two builds emit byte-identical bytes regardless
+// of the storage layer's ordering choices.
+//
+// Output blobs (rec.Output) are pre-canonicalised so the canonical bytes
+// are stable across backends.
+func (b *Builder) collectApplyRecords(ctx context.Context, av *domain.ApprovedVersion) ([]ApplyRecordRef, error) {
+	plans, err := b.store.ListPlansByApprovedVersion(ctx, av.ID)
+	if err != nil {
+		return nil, fmt.Errorf("list plans by approved version: %w", err)
+	}
+	out := make([]ApplyRecordRef, 0)
+	for _, plan := range plans {
+		if plan == nil {
+			continue
+		}
+		records, err := b.store.ListPlanApplyRecordsByPlan(ctx, plan.ID)
+		if err != nil {
+			return nil, fmt.Errorf("list plan apply records for plan %s: %w", plan.ID, err)
+		}
+		for _, rec := range records {
+			if rec == nil {
+				continue
+			}
+			ref, err := applyRecordRef(rec)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, ref)
+		}
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		ai, aj := out[i].StartedAt, out[j].StartedAt
+		if !ai.Equal(aj) {
+			return ai.Before(aj)
+		}
+		return out[i].ID < out[j].ID
+	})
+	return out, nil
+}
+
+// applyRecordRef projects a PlanApplyRecord into the pack-facing ref.
+// The Output blob is canonicalised so the bytes are stable regardless
+// of how Postgres serialised the JSONB row.
+func applyRecordRef(rec *domain.PlanApplyRecord) (ApplyRecordRef, error) {
+	out := ApplyRecordRef{
+		ID:             rec.ID,
+		PlanID:         rec.PlanID,
+		State:          string(rec.State),
+		DryRun:         rec.DryRun,
+		Target:         rec.Target,
+		StartedAt:      rec.StartedAt.UTC(),
+		AppliedItems:   rec.AppliedItems,
+		FailedItems:    rec.FailedItems,
+		SummaryHash:    rec.SummaryHash,
+		FailureMessage: rec.FailureMessage,
+	}
+	if rec.FinishedAt != nil {
+		t := rec.FinishedAt.UTC()
+		out.FinishedAt = &t
+	}
+	if len(rec.Output) > 0 {
+		canonical, err := Canonicalize(rec.Output)
+		if err != nil {
+			return ApplyRecordRef{}, fmt.Errorf("canonicalize apply record %s output: %w", rec.ID, err)
+		}
+		// Empty objects are kept as "{}" so the column is stably present;
+		// only nil/empty input becomes the zero RawMessage (omitempty
+		// elides it from the wire shape).
+		if string(canonical) != "" {
+			out.Output = canonical
+		}
+	}
+	return out, nil
 }
 
 // collectDriftScans loads every scan against av's product, filters to the

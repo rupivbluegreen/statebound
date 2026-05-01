@@ -10,6 +10,9 @@ import (
 type EventKind string
 
 const (
+	EventApplyFailed            EventKind = "apply.failed"
+	EventApplyStarted           EventKind = "apply.started"
+	EventApplySucceeded         EventKind = "apply.succeeded"
 	EventApprovalRecorded       EventKind = "approval.recorded"
 	EventApprovedVersionCreated EventKind = "approved_version.created"
 	EventAssetCreated           EventKind = "asset.created"

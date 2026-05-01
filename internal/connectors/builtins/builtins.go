@@ -14,10 +14,12 @@ import (
 	"statebound.dev/statebound/internal/connectors"
 	"statebound.dev/statebound/internal/connectors/linux_ssh"
 	"statebound.dev/statebound/internal/connectors/linux_sudo"
+	"statebound.dev/statebound/internal/connectors/postgres"
 )
 
 // Register adds every core-shipped connector to r.
 func Register(r *connectors.Registry) {
 	r.Register(linux_sudo.New())
 	r.Register(linux_ssh.New())
+	r.Register(postgres.New())
 }

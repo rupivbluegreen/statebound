@@ -24,6 +24,7 @@ const (
 	AuthTypeLinuxSudo             AuthorizationType = "linux.sudo"
 	AuthTypeLinuxLocalGroup       AuthorizationType = "linux.local-group"
 	AuthTypePostgresGrant         AuthorizationType = "postgres.grant"
+	AuthTypePostgresRole          AuthorizationType = "postgres.role"
 	AuthTypeKubernetesRoleBinding AuthorizationType = "kubernetes.role-binding"
 )
 
@@ -74,6 +75,7 @@ func IsValidAuthorizationType(s string) bool {
 		AuthTypeLinuxSudo,
 		AuthTypeLinuxLocalGroup,
 		AuthTypePostgresGrant,
+		AuthTypePostgresRole,
 		AuthTypeKubernetesRoleBinding:
 		return true
 	}
@@ -137,6 +139,8 @@ func validateAuthSpec(t AuthorizationType, spec map[string]any) error {
 		return validateLinuxLocalGroupSpec(spec)
 	case AuthTypePostgresGrant:
 		return validatePostgresGrantSpec(spec)
+	case AuthTypePostgresRole:
+		return validatePostgresRoleSpec(spec)
 	case AuthTypeKubernetesRoleBinding:
 		return validateKubernetesRoleBindingSpec(spec)
 	}
@@ -224,12 +228,52 @@ func validatePostgresGrantSpec(spec map[string]any) error {
 	if len(privs) == 0 {
 		return errors.New("privileges must be a non-empty list")
 	}
-	objs, err := requireStringSlice(spec, "objects")
+	// Phase 6 widened postgres.grant to support either:
+	//   - the legacy shape: objects = []string of "schema.table" patterns; or
+	//   - the structured shape: database (required string) + schema (optional
+	//     string) + objects (map of {tables: [...], sequences: [...], ...}).
+	// The connector does the deep validation; here we only enforce that
+	// SOMETHING describes the grant target.
+	if objsRaw, ok := spec["objects"]; ok && objsRaw != nil {
+		switch v := objsRaw.(type) {
+		case []any, []string:
+			// Legacy shape: list of strings. Empty list is an error.
+			objs, err := toStringSlice(v)
+			if err != nil {
+				return fmt.Errorf("objects: %w", err)
+			}
+			if len(objs) == 0 {
+				return errors.New("objects must be a non-empty list")
+			}
+		case map[string]any:
+			// Structured shape: requires database to be set so the
+			// connector knows where to apply the grant. The connector
+			// validates the inner shape (tables/sequences/...) against
+			// the live catalog.
+			if _, err := requireString(spec, "database"); err != nil {
+				return err
+			}
+			if len(v) == 0 {
+				return errors.New("objects must declare at least one kind (e.g. tables)")
+			}
+		default:
+			return errors.New("objects must be a list of strings or a structured object")
+		}
+		return nil
+	}
+	return errors.New("objects is required")
+}
+
+func validatePostgresRoleSpec(spec map[string]any) error {
+	if _, err := requireString(spec, "database"); err != nil {
+		return err
+	}
+	role, err := requireString(spec, "role")
 	if err != nil {
 		return err
 	}
-	if len(objs) == 0 {
-		return errors.New("objects must be a non-empty list")
+	if role == "" {
+		return errors.New("role must be non-empty")
 	}
 	return nil
 }
