@@ -50,6 +50,11 @@ jobs:
       - name: Sync Rego bundle into authz embed
         run: cp policies/builtin/*.rego internal/authz/bundle/
 
+      - name: Sync OpenAPI spec into api embed
+        # Phase 8 wave B: schemas/openapi.yaml is the canonical source;
+        # internal/api/openapi.yaml is the embedded copy.
+        run: cp schemas/openapi.yaml internal/api/openapi.yaml
+
       - name: Vet
         run: go vet ./...
 
@@ -226,3 +231,27 @@ jobs:
 
           # Standalone product create still works
           ./bin/statebound product create checkout-api --owner ci-bot --description "CI smoke product"
+
+          # Phase 8 wave B: HTTP API surface
+          # Run the server in dev-token mode in the background, curl
+          # the read endpoints, then shut it down.
+          STATEBOUND_DEV_TOKEN=ci-smoke STATEBOUND_DEV_ACTOR=human:ci-bot \
+            ./bin/statebound api serve --listen 127.0.0.1:18080 &
+          API_PID=$!
+          # Give the server time to bind. Loop until /healthz responds.
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:18080/healthz > /dev/null; then break; fi
+            sleep 0.5
+          done
+          curl -fsS http://127.0.0.1:18080/healthz
+          curl -fsS http://127.0.0.1:18080/readyz
+          curl -fsS http://127.0.0.1:18080/openapi.yaml > /tmp/openapi.yaml
+          test -s /tmp/openapi.yaml
+          # Authed read
+          curl -fsS -H "Authorization: Bearer ci-smoke" http://127.0.0.1:18080/v1/products | jq '.items | length'
+          # No token = 401
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18080/v1/products)" = "401"
+          # Bad token = 401
+          test "$(curl -s -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer wrong' http://127.0.0.1:18080/v1/products)" = "401"
+          kill $API_PID
+          wait $API_PID 2>/dev/null || true

@@ -1,0 +1,976 @@
+openapi: 3.1.0
+info:
+  title: Statebound HTTP API
+  version: "0.8.0"
+  summary: Read-only governance API for Statebound core (Phase 8 wave B).
+  description: |
+    The Statebound HTTP API exposes the core's read surface so the optional
+    `statebound-reason` add-on (and other registered ServiceAccount clients)
+    can consume it.
+
+    ## Boundaries
+
+    - **Read-only.** Write operations (approve, plan, apply) remain CLI-only
+      in v0.8. Agents never mutate approved state.
+    - **Authenticated.** Every `/v1/...` route requires a valid bearer token.
+      Tokens may be OIDC-issued JWTs (when configured with
+      `--oidc-issuer`/`--oidc-audience`) or a static dev token (when
+      configured with `--dev-token`).
+    - **OPA-gated.** Authorization is evaluated through the same RBAC layer
+      used by the CLI; the `product:read` capability gates every read route.
+    - **No private material.** Signing keys expose only the public half plus
+      fingerprint. `private_key_ref` is never returned.
+
+  license:
+    name: Apache-2.0
+    identifier: Apache-2.0
+
+servers:
+  - url: http://localhost:8080
+    description: Local development.
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: health
+    description: Liveness and readiness probes.
+  - name: products
+    description: Governed Products.
+  - name: change-sets
+    description: Draft sets of changes awaiting review.
+  - name: audit
+    description: Append-only audit log.
+  - name: evidence
+    description: Immutable evidence packs.
+  - name: plans
+    description: Connector-generated plans.
+  - name: drift
+    description: Drift scans and findings.
+  - name: policy
+    description: OPA policy decisions.
+  - name: signing
+    description: Signing-key registry (public-only).
+  - name: apply
+    description: Plan apply records.
+
+paths:
+  /healthz:
+    get:
+      tags: [health]
+      summary: Liveness probe.
+      security: []
+      responses:
+        "200":
+          description: Server is alive.
+          content:
+            text/plain: { schema: { type: string, example: "ok" } }
+
+  /readyz:
+    get:
+      tags: [health]
+      summary: Readiness probe (pings the storage layer).
+      security: []
+      responses:
+        "200":
+          description: Storage is reachable.
+          content:
+            text/plain: { schema: { type: string, example: "ready" } }
+        "503":
+          description: Storage unreachable.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /openapi.yaml:
+    get:
+      tags: [health]
+      summary: This OpenAPI document.
+      security: []
+      responses:
+        "200":
+          description: OpenAPI YAML.
+          content:
+            application/yaml:
+              schema: { type: string }
+
+  /v1/products:
+    get:
+      tags: [products]
+      summary: List products.
+      operationId: listProducts
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PaginatedProducts" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /v1/products/{id}:
+    get:
+      tags: [products]
+      summary: Get a product by id.
+      operationId: getProduct
+      parameters:
+        - $ref: "#/components/parameters/PathID"
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Product" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/products/{id}/change-sets:
+    get:
+      tags: [change-sets]
+      summary: List change sets for a product.
+      operationId: listChangeSetsForProduct
+      parameters:
+        - $ref: "#/components/parameters/PathID"
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/StateFilter"
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PaginatedChangeSets" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/change-sets:
+    get:
+      tags: [change-sets]
+      summary: List change sets.
+      operationId: listChangeSets
+      parameters:
+        - in: query
+          name: product_id
+          schema: { type: string }
+        - $ref: "#/components/parameters/StateFilter"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PaginatedChangeSets" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /v1/change-sets/{id}:
+    get:
+      tags: [change-sets]
+      summary: Get a change set with its items.
+      operationId: getChangeSet
+      parameters:
+        - $ref: "#/components/parameters/PathID"
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ChangeSetDetail" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/audit-events:
+    get:
+      tags: [audit]
+      summary: List audit events.
+      operationId: listAuditEvents
+      parameters:
+        - in: query
+          name: kind
+          schema: { type: string }
+        - in: query
+          name: resource_type
+          schema: { type: string }
+        - in: query
+          name: resource_id
+          schema: { type: string }
+        - in: query
+          name: since
+          description: RFC3339 timestamp; events older than this are excluded.
+          schema: { type: string, format: date-time }
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PaginatedAuditEvents" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /v1/audit-events/verify:
+    get:
+      tags: [audit]
+      summary: Verify the audit hash chain.
+      operationId: verifyAuditChain
+      responses:
+        "200":
+          description: Verification result.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AuditChainVerifyResult" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /v1/evidence-packs:
+    get:
+      tags: [evidence]
+      summary: List evidence packs.
+      operationId: listEvidencePacks
+      parameters:
+        - in: query
+          name: product_id
+          schema: { type: string }
+        - in: query
+          name: format
+          schema: { type: string, enum: [json, markdown] }
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PaginatedEvidencePacks" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /v1/evidence-packs/{id}:
+    get:
+      tags: [evidence]
+      summary: Get an evidence pack with content.
+      operationId: getEvidencePack
+      parameters:
+        - $ref: "#/components/parameters/PathID"
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/EvidencePack" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/plans:
+    get:
+      tags: [plans]
+      summary: List plans.
+      operationId: listPlans
+      parameters:
+        - in: query
+          name: product_id
+          schema: { type: string }
+        - in: query
+          name: approved_version_id
+          schema: { type: string }
+        - in: query
+          name: connector_name
+          schema: { type: string }
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PaginatedPlans" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /v1/plans/{id}:
+    get:
+      tags: [plans]
+      summary: Get a plan with items.
+      operationId: getPlan
+      parameters:
+        - $ref: "#/components/parameters/PathID"
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PlanDetail" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/drift-scans:
+    get:
+      tags: [drift]
+      summary: List drift scans.
+      operationId: listDriftScans
+      parameters:
+        - in: query
+          name: product_id
+          schema: { type: string }
+        - in: query
+          name: approved_version_id
+          schema: { type: string }
+        - in: query
+          name: connector_name
+          schema: { type: string }
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PaginatedDriftScans" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /v1/drift-scans/{id}:
+    get:
+      tags: [drift]
+      summary: Get a drift scan with findings.
+      operationId: getDriftScan
+      parameters:
+        - $ref: "#/components/parameters/PathID"
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DriftScanDetail" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/policy-decisions:
+    get:
+      tags: [policy]
+      summary: List policy decisions.
+      operationId: listPolicyDecisions
+      parameters:
+        - in: query
+          name: change_set_id
+          schema: { type: string }
+        - in: query
+          name: outcome
+          schema: { type: string }
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PaginatedPolicyDecisions" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /v1/policy-decisions/{id}:
+    get:
+      tags: [policy]
+      summary: Get a policy decision.
+      operationId: getPolicyDecision
+      parameters:
+        - $ref: "#/components/parameters/PathID"
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PolicyDecision" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/signing-keys:
+    get:
+      tags: [signing]
+      summary: List signing keys (public material only).
+      operationId: listSigningKeys
+      parameters:
+        - in: query
+          name: include_disabled
+          schema: { type: boolean, default: false }
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PaginatedSigningKeys" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /v1/signing-keys/{key_id}:
+    get:
+      tags: [signing]
+      summary: Get a signing key (public material only).
+      operationId: getSigningKey
+      parameters:
+        - in: path
+          name: key_id
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SigningKey" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/plan-apply-records:
+    get:
+      tags: [apply]
+      summary: List plan apply records.
+      operationId: listPlanApplyRecords
+      parameters:
+        - in: query
+          name: plan_id
+          schema: { type: string }
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PaginatedPlanApplyRecords" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /v1/plan-apply-records/{id}:
+    get:
+      tags: [apply]
+      summary: Get a plan apply record.
+      operationId: getPlanApplyRecord
+      parameters:
+        - $ref: "#/components/parameters/PathID"
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PlanApplyRecord" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        OIDC-issued JWT (production) or a static dev token (local dev). The
+        token's `sub` claim (or the dev-actor mapping) is resolved against
+        the actor_role_bindings table to determine RBAC capabilities.
+
+  parameters:
+    PathID:
+      in: path
+      name: id
+      required: true
+      schema: { type: string }
+    Limit:
+      in: query
+      name: limit
+      schema: { type: integer, minimum: 0, maximum: 1000, default: 100 }
+    StateFilter:
+      in: query
+      name: state
+      schema:
+        type: string
+        enum: [draft, submitted, approved, rejected, conflicted]
+
+  responses:
+    Unauthorized:
+      description: Missing or invalid bearer token.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Forbidden:
+      description: Authenticated but lacks the required capability.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    NotFound:
+      description: Resource not found.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+
+  schemas:
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          example: "missing_token"
+        message:
+          type: string
+          example: "Authorization header is required"
+        request_id:
+          type: string
+
+    Actor:
+      type: object
+      required: [kind, subject]
+      properties:
+        kind:
+          type: string
+          enum: [human, service_account, system]
+        subject:
+          type: string
+
+    PageMeta:
+      type: object
+      required: [count]
+      properties:
+        count: { type: integer }
+        next_cursor:
+          type: string
+          nullable: true
+
+    Product:
+      type: object
+      required: [id, name, owner, created_at, updated_at]
+      properties:
+        id: { type: string }
+        name: { type: string }
+        owner: { type: string }
+        description: { type: string }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    PaginatedProducts:
+      type: object
+      required: [items, count]
+      properties:
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/Product" }
+        count: { type: integer }
+        next_cursor:
+          type: string
+          nullable: true
+
+    ChangeSet:
+      type: object
+      required: [id, product_id, state, title, requested_by, created_at, updated_at]
+      properties:
+        id: { type: string }
+        product_id: { type: string }
+        state:
+          type: string
+          enum: [draft, submitted, approved, rejected, conflicted]
+        title: { type: string }
+        description: { type: string }
+        requested_by: { $ref: "#/components/schemas/Actor" }
+        parent_approved_version_id:
+          type: string
+          nullable: true
+        submitted_at:
+          type: string
+          format: date-time
+          nullable: true
+        decided_at:
+          type: string
+          format: date-time
+          nullable: true
+        decision_reason: { type: string }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    ChangeSetItem:
+      type: object
+      required: [id, change_set_id, kind, action, resource_name]
+      properties:
+        id: { type: string }
+        change_set_id: { type: string }
+        kind: { type: string }
+        action:
+          type: string
+          enum: [add, update, delete]
+        resource_name: { type: string }
+        before:
+          type: object
+          additionalProperties: true
+          nullable: true
+        after:
+          type: object
+          additionalProperties: true
+          nullable: true
+        created_at: { type: string, format: date-time }
+
+    ChangeSetDetail:
+      allOf:
+        - $ref: "#/components/schemas/ChangeSet"
+        - type: object
+          properties:
+            items:
+              type: array
+              items: { $ref: "#/components/schemas/ChangeSetItem" }
+
+    PaginatedChangeSets:
+      type: object
+      required: [items, count]
+      properties:
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/ChangeSet" }
+        count: { type: integer }
+        next_cursor:
+          type: string
+          nullable: true
+
+    AuditEvent:
+      type: object
+      required: [id, kind, actor, resource_type, resource_id, occurred_at]
+      properties:
+        id: { type: string }
+        kind: { type: string }
+        actor: { $ref: "#/components/schemas/Actor" }
+        resource_type: { type: string }
+        resource_id: { type: string }
+        payload:
+          type: object
+          additionalProperties: true
+        occurred_at: { type: string, format: date-time }
+        prev_hash: { type: string }
+        hash: { type: string }
+
+    PaginatedAuditEvents:
+      type: object
+      required: [items, count]
+      properties:
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/AuditEvent" }
+        count: { type: integer }
+        next_cursor:
+          type: string
+          nullable: true
+
+    AuditChainVerifyResult:
+      type: object
+      required: [ok, count]
+      properties:
+        ok: { type: boolean }
+        count: { type: integer }
+        first_mismatch:
+          type: string
+          nullable: true
+
+    EvidencePack:
+      type: object
+      required:
+        - id
+        - product_id
+        - approved_version_id
+        - sequence
+        - format
+        - content_hash
+        - generated_at
+        - generated_by
+      properties:
+        id: { type: string }
+        product_id: { type: string }
+        approved_version_id: { type: string }
+        sequence: { type: integer }
+        format: { type: string, enum: [json, markdown] }
+        content_hash: { type: string }
+        content:
+          description: |
+            Canonical bytes of the pack as JSON. For markdown packs, this is
+            the JSON envelope (`{"format":"markdown","body":"..."}`).
+          type: object
+          additionalProperties: true
+        generated_at: { type: string, format: date-time }
+        generated_by: { $ref: "#/components/schemas/Actor" }
+
+    PaginatedEvidencePacks:
+      type: object
+      required: [items, count]
+      properties:
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/EvidencePack" }
+        count: { type: integer }
+        next_cursor:
+          type: string
+          nullable: true
+
+    Plan:
+      type: object
+      required:
+        - id
+        - product_id
+        - approved_version_id
+        - sequence
+        - connector_name
+        - connector_version
+        - state
+        - content_hash
+        - generated_at
+        - generated_by
+      properties:
+        id: { type: string }
+        product_id: { type: string }
+        approved_version_id: { type: string }
+        sequence: { type: integer }
+        connector_name: { type: string }
+        connector_version: { type: string }
+        state:
+          type: string
+          enum: [draft, ready, refused, applied, failed]
+        summary: { type: string }
+        content_hash: { type: string }
+        generated_at: { type: string, format: date-time }
+        generated_by: { $ref: "#/components/schemas/Actor" }
+        refused_reason: { type: string }
+
+    PlanItem:
+      type: object
+      required: [id, plan_id, sequence, action, resource_kind, resource_ref]
+      properties:
+        id: { type: string }
+        plan_id: { type: string }
+        sequence: { type: integer }
+        action: { type: string }
+        resource_kind: { type: string }
+        resource_ref: { type: string }
+        body:
+          type: object
+          additionalProperties: true
+        risk: { type: string }
+        note: { type: string }
+
+    PlanDetail:
+      allOf:
+        - $ref: "#/components/schemas/Plan"
+        - type: object
+          properties:
+            items:
+              type: array
+              items: { $ref: "#/components/schemas/PlanItem" }
+
+    PaginatedPlans:
+      type: object
+      required: [items, count]
+      properties:
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/Plan" }
+        count: { type: integer }
+        next_cursor:
+          type: string
+          nullable: true
+
+    DriftScan:
+      type: object
+      required:
+        - id
+        - product_id
+        - approved_version_id
+        - sequence
+        - connector_name
+        - connector_version
+        - state
+        - source_ref
+        - started_at
+        - initiated_by
+      properties:
+        id: { type: string }
+        product_id: { type: string }
+        approved_version_id: { type: string }
+        sequence: { type: integer }
+        connector_name: { type: string }
+        connector_version: { type: string }
+        state:
+          type: string
+          enum: [running, succeeded, failed]
+        source_ref: { type: string }
+        started_at: { type: string, format: date-time }
+        finished_at:
+          type: string
+          format: date-time
+          nullable: true
+        initiated_by: { $ref: "#/components/schemas/Actor" }
+        failure_message: { type: string }
+        summary_hash: { type: string }
+        finding_count: { type: integer }
+
+    DriftFinding:
+      type: object
+      required: [id, scan_id, sequence, kind, severity, resource_kind, resource_ref]
+      properties:
+        id: { type: string }
+        scan_id: { type: string }
+        sequence: { type: integer }
+        kind: { type: string, enum: [missing, unexpected, modified] }
+        severity:
+          type: string
+          enum: [info, low, medium, high, critical]
+        resource_kind: { type: string }
+        resource_ref: { type: string }
+        desired:
+          type: object
+          additionalProperties: true
+          nullable: true
+        actual:
+          type: object
+          additionalProperties: true
+          nullable: true
+        diff:
+          type: object
+          additionalProperties: true
+        message: { type: string }
+        detected_at: { type: string, format: date-time }
+
+    DriftScanDetail:
+      allOf:
+        - $ref: "#/components/schemas/DriftScan"
+        - type: object
+          properties:
+            findings:
+              type: array
+              items: { $ref: "#/components/schemas/DriftFinding" }
+
+    PaginatedDriftScans:
+      type: object
+      required: [items, count]
+      properties:
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/DriftScan" }
+        count: { type: integer }
+        next_cursor:
+          type: string
+          nullable: true
+
+    PolicyDecision:
+      type: object
+      required:
+        - id
+        - change_set_id
+        - phase
+        - outcome
+        - bundle_hash
+        - evaluated_at
+      properties:
+        id: { type: string }
+        change_set_id: { type: string }
+        phase: { type: string }
+        outcome: { type: string }
+        rules:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        input:
+          type: object
+          additionalProperties: true
+        bundle_hash: { type: string }
+        evaluated_at: { type: string, format: date-time }
+
+    PaginatedPolicyDecisions:
+      type: object
+      required: [items, count]
+      properties:
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/PolicyDecision" }
+        count: { type: integer }
+        next_cursor:
+          type: string
+          nullable: true
+
+    SigningKey:
+      description: |
+        A signing key. Only the public material (public_key bytes,
+        fingerprint, lifecycle metadata) is exposed. The `private_key_ref`
+        and any private bytes are NEVER included in API responses.
+      type: object
+      required:
+        - key_id
+        - algorithm
+        - public_key
+        - fingerprint
+        - created_at
+        - created_by
+        - disabled
+      properties:
+        key_id: { type: string }
+        algorithm: { type: string, enum: [ed25519] }
+        public_key:
+          description: Base64-encoded public-key bytes.
+          type: string
+        fingerprint: { type: string }
+        created_at: { type: string, format: date-time }
+        created_by: { $ref: "#/components/schemas/Actor" }
+        expires_at:
+          type: string
+          format: date-time
+          nullable: true
+        disabled: { type: boolean }
+        note: { type: string }
+        last_used_at:
+          type: string
+          format: date-time
+          nullable: true
+
+    PaginatedSigningKeys:
+      type: object
+      required: [items, count]
+      properties:
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/SigningKey" }
+        count: { type: integer }
+        next_cursor:
+          type: string
+          nullable: true
+
+    PlanApplyRecord:
+      type: object
+      required: [id, plan_id, state, started_at, actor, target, dry_run]
+      properties:
+        id: { type: string }
+        plan_id: { type: string }
+        state:
+          type: string
+          enum: [running, succeeded, failed]
+        started_at: { type: string, format: date-time }
+        finished_at:
+          type: string
+          format: date-time
+          nullable: true
+        actor: { $ref: "#/components/schemas/Actor" }
+        target: { type: string }
+        dry_run: { type: boolean }
+        applied_items: { type: integer }
+        failed_items: { type: integer }
+        failure_message: { type: string }
+        summary_hash: { type: string }
+        output:
+          type: object
+          additionalProperties: true
+
+    PaginatedPlanApplyRecords:
+      type: object
+      required: [items, count]
+      properties:
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/PlanApplyRecord" }
+        count: { type: integer }
+        next_cursor:
+          type: string
+          nullable: true

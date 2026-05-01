@@ -86,4 +86,5 @@ func init() {
 	addInferenceCmd(rootCmd)
 	addRoleCmd(rootCmd)
 	addKeyCmd(rootCmd)
+	addAPICmd(rootCmd)
 }
