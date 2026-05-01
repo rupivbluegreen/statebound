@@ -28,8 +28,8 @@ var topLevelSections = []sectionEntry{
 	{name: "Service Accounts", phase: "Phase 1"},
 	{name: "Global Objects", phase: "Phase 1"},
 	{name: "Authorizations", phase: "Phase 1"},
-	{name: "Change Sets", phase: "Phase 2"},
-	{name: "Approvals", phase: "Phase 2"},
+	{name: "Change Sets", phase: "Phase 2", available: true},
+	{name: "Approvals", phase: "Phase 2", available: true},
 	{name: "Plans", phase: "Phase 4"},
 	{name: "Drift Findings", phase: "Phase 4'"},
 	{name: "Evidence Packs", phase: "Phase 3"},
@@ -85,9 +85,22 @@ func (s sectionsScreen) Update(msg tea.Msg) (screen, tea.Cmd) {
 				}
 			}
 		}
-		// Phase 1 wires Products only.
-		if entry.name == "Products" {
+		// Phase 1 wires Products; Phase 2 wave A adds Change Sets and Approvals.
+		switch entry.name {
+		case "Products":
 			next := newProductsScreen(s.store)
+			return s, tea.Batch(
+				func() tea.Msg { return pushScreenMsg{s: next} },
+				next.Init(),
+			)
+		case "Change Sets":
+			next := newChangeSetsScreen(s.store)
+			return s, tea.Batch(
+				func() tea.Msg { return pushScreenMsg{s: next} },
+				next.Init(),
+			)
+		case "Approvals":
+			next := newApprovalsScreen(s.store)
 			return s, tea.Batch(
 				func() tea.Msg { return pushScreenMsg{s: next} },
 				next.Init(),

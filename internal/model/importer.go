@@ -4,118 +4,92 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"reflect"
-	"sort"
+	"os"
+	"time"
 
 	"statebound.dev/statebound/internal/domain"
 	"statebound.dev/statebound/internal/storage"
 )
 
-// ImportResult summarizes what an Import call did. Counts make Phase-1 import
-// idempotent checks easy: a no-op import has zeros across the *Added /
-// *Updated / *Deleted fields.
+// ImportMode selects how Import handles an incoming model.
+type ImportMode string
+
+const (
+	// ImportModeChangeSet is the production default: produce a draft ChangeSet
+	// for human review, never touch live tables.
+	ImportModeChangeSet ImportMode = "changeset"
+	// ImportModeAutoApprove auto-approves the import in one step. Dev-only:
+	// requires the STATEBOUND_DEV_AUTO_APPROVE=true environment override.
+	ImportModeAutoApprove ImportMode = "auto-approve"
+)
+
+// envAutoApprove gates ImportModeAutoApprove. Kept as a constant so tests can
+// reference the name without retyping.
+const envAutoApprove = "STATEBOUND_DEV_AUTO_APPROVE"
+
+// ImportResult summarizes what an Import call produced. ChangeSetID is set on
+// every successful run; ApprovedVersionID is set only in auto-approve mode.
+// Diff is always populated (possibly empty).
 type ImportResult struct {
-	Product            string
-	ProductCreated     bool
-	ProductUpdated     bool
-	AssetsAdded        int
-	AssetsUpdated      int
-	AssetsDeleted      int
-	AssetScopesAdded   int
-	AssetScopesUpdated int
-	AssetScopesDeleted int
-	EntitlementsAdded   int
-	EntitlementsUpdated int
-	EntitlementsDeleted int
-	ServiceAccountsAdded   int
-	ServiceAccountsUpdated int
-	ServiceAccountsDeleted int
-	GlobalObjectsAdded   int
-	GlobalObjectsUpdated int
-	GlobalObjectsDeleted int
-	AuthorizationsTotal int
+	ProductID         domain.ID
+	ChangeSetID       *domain.ID
+	ApprovedVersionID *domain.ID
+	Diff              *Diff
 }
 
-// Import applies a desired-state model to storage with sync semantics: rows
-// not present in the YAML are deleted, rows that have changed are updated,
-// and missing rows are created. It runs entirely in a single transaction.
-//
-// Validation runs first; on any findings, Import returns a *ValidationFailedError
-// without touching the database.
-func Import(ctx context.Context, store storage.Storage, m *ProductAuthorizationModel, actor domain.Actor) (*ImportResult, error) {
+// Import validates the model, computes the diff against the latest approved
+// version (if any), and either records a draft ChangeSet (default) or auto-
+// approves it (dev mode). On validation failure it returns
+// *ValidationFailedError without opening any transaction.
+func Import(ctx context.Context, store storage.Storage, m *ProductAuthorizationModel, actor domain.Actor, mode ImportMode) (*ImportResult, error) {
 	if findings := Validate(m); len(findings) > 0 {
 		return nil, &ValidationFailedError{Findings: findings}
 	}
+	if mode == ImportModeAutoApprove && os.Getenv(envAutoApprove) != "true" {
+		return nil, fmt.Errorf("auto-approve mode requires %s=true", envAutoApprove)
+	}
 
-	result := &ImportResult{Product: m.Metadata.Product}
+	result := &ImportResult{Diff: &Diff{}}
 	err := store.WithTx(ctx, func(tx storage.Storage) error {
-		product, err := upsertProduct(ctx, tx, m, result)
+		product, err := ensureProduct(ctx, tx, m, actor)
 		if err != nil {
 			return err
 		}
-		assetIDs, err := syncAssets(ctx, tx, product.ID, m.Spec.Assets, result)
-		if err != nil {
-			return err
-		}
-		scopeIDs, err := syncAssetScopes(ctx, tx, product.ID, m.Spec.AssetScopes, assetIDs, result)
-		if err != nil {
-			return err
-		}
-		globalIDs, err := syncGlobalObjects(ctx, tx, &product.ID, m.Spec.GlobalObjects, result)
-		if err != nil {
-			return err
-		}
-		entitlementIDs, err := syncEntitlements(ctx, tx, product.ID, m.Spec.Entitlements, result)
-		if err != nil {
-			return err
-		}
-		serviceAccountIDs, err := syncServiceAccounts(ctx, tx, product.ID, m.Spec.ServiceAccounts, result)
+		result.ProductID = product.ID
+
+		// Resolve the parent approved version (if any) and reconstruct the
+		// previous-state model from its snapshot.
+		parentVersionID, before, err := loadParentVersion(ctx, tx, product.ID)
 		if err != nil {
 			return err
 		}
 
-		// Authorizations: delete-and-recreate everything attached to each
-		// entitlement, service account, and global object owned by this
-		// product. Spec is the desired state; previous rows are gone.
-		authCount := 0
-		for _, e := range m.Spec.Entitlements {
-			parentID := entitlementIDs[e.Name]
-			n, err := replaceAuthorizations(ctx, tx, domain.AuthParentEntitlement, parentID, e.Authorizations, scopeIDs, globalIDs)
-			if err != nil {
-				return err
-			}
-			authCount += n
-		}
-		for _, a := range m.Spec.ServiceAccounts {
-			parentID := serviceAccountIDs[a.Name]
-			n, err := replaceAuthorizations(ctx, tx, domain.AuthParentServiceAccount, parentID, a.Authorizations, scopeIDs, globalIDs)
-			if err != nil {
-				return err
-			}
-			authCount += n
-		}
-		result.AuthorizationsTotal = authCount
-
-		// One audit event per import; row-level events arrive in Phase 2
-		// alongside the ChangeSet diff machinery.
-		payload := map[string]any{
-			"product": m.Metadata.Product,
-			"counts": map[string]any{
-				"assets":           len(m.Spec.Assets),
-				"asset_scopes":     len(m.Spec.AssetScopes),
-				"entitlements":     len(m.Spec.Entitlements),
-				"service_accounts": len(m.Spec.ServiceAccounts),
-				"global_objects":   len(m.Spec.GlobalObjects),
-				"authorizations":   authCount,
-			},
-		}
-		evt, err := domain.NewAuditEvent(domain.EventModelImported, actor, "product", string(product.ID), payload)
+		diff, err := ComputeDiff(before, m)
 		if err != nil {
-			return fmt.Errorf("build audit event: %w", err)
+			return fmt.Errorf("compute diff: %w", err)
 		}
-		if err := tx.AppendAuditEvent(ctx, evt); err != nil {
-			return fmt.Errorf("append audit event: %w", err)
+		result.Diff = diff
+		if diff.IsEmpty() {
+			return nil
 		}
+
+		cs, err := createChangeSet(ctx, tx, product, m, parentVersionID, diff, actor)
+		if err != nil {
+			return err
+		}
+		csID := cs.ID
+		result.ChangeSetID = &csID
+
+		if mode == ImportModeChangeSet {
+			return nil
+		}
+		// ImportModeAutoApprove: walk the change set through the full state
+		// machine in this same tx, mint the approved version, and apply it.
+		avID, err := autoApprove(ctx, tx, product.ID, m, cs, parentVersionID, actor)
+		if err != nil {
+			return err
+		}
+		result.ApprovedVersionID = &avID
 		return nil
 	})
 	if err != nil {
@@ -124,390 +98,208 @@ func Import(ctx context.Context, store storage.Storage, m *ProductAuthorizationM
 	return result, nil
 }
 
-// upsertProduct creates the product if absent or updates owner/description if
-// the row already exists. The created/updated flags drive ImportResult.
-func upsertProduct(ctx context.Context, tx storage.Storage, m *ProductAuthorizationModel, r *ImportResult) (*domain.Product, error) {
+// ensureProduct fetches the product row by name, creating it (and emitting
+// product.created) when absent.
+func ensureProduct(ctx context.Context, tx storage.Storage, m *ProductAuthorizationModel, actor domain.Actor) (*domain.Product, error) {
 	existing, err := tx.GetProductByName(ctx, m.Metadata.Product)
 	if err != nil && !errors.Is(err, storage.ErrNotFound) {
 		return nil, fmt.Errorf("lookup product: %w", err)
 	}
-	if existing == nil {
-		p, err := domain.NewProduct(m.Metadata.Product, m.Metadata.Owner, m.Metadata.Description)
-		if err != nil {
-			return nil, fmt.Errorf("build product: %w", err)
-		}
-		if err := tx.CreateProduct(ctx, p); err != nil {
-			return nil, fmt.Errorf("create product: %w", err)
-		}
-		r.ProductCreated = true
-		return p, nil
+	if existing != nil {
+		return existing, nil
 	}
-	if existing.Owner != m.Metadata.Owner || existing.Description != m.Metadata.Description {
-		existing.Owner = m.Metadata.Owner
-		existing.Description = m.Metadata.Description
-		existing.UpdatedAt = nowUTC()
-		if err := tx.UpdateProduct(ctx, existing); err != nil {
-			return nil, fmt.Errorf("update product: %w", err)
-		}
-		r.ProductUpdated = true
-	}
-	return existing, nil
-}
-
-func syncAssets(ctx context.Context, tx storage.Storage, productID domain.ID, want []YAMLAsset, r *ImportResult) (map[string]domain.ID, error) {
-	existing, err := tx.ListAssetsByProduct(ctx, productID)
+	p, err := domain.NewProduct(m.Metadata.Product, m.Metadata.Owner, m.Metadata.Description)
 	if err != nil {
-		return nil, fmt.Errorf("list assets: %w", err)
+		return nil, fmt.Errorf("build product: %w", err)
 	}
-	byName := indexByName(existing, func(a *domain.Asset) string { return a.Name })
-	desiredNames := make(map[string]struct{}, len(want))
-	out := make(map[string]domain.ID, len(want))
-
-	for _, y := range want {
-		desiredNames[y.Name] = struct{}{}
-		if cur, ok := byName[y.Name]; ok {
-			labels := copyLabels(y.Labels)
-			if cur.Type == domain.AssetType(y.Type) &&
-				cur.Environment == domain.Environment(y.Environment) &&
-				cur.Description == y.Description &&
-				labelsEqual(cur.Labels, labels) {
-				out[y.Name] = cur.ID
-				continue
-			}
-			cur.Type = domain.AssetType(y.Type)
-			cur.Environment = domain.Environment(y.Environment)
-			cur.Description = y.Description
-			cur.Labels = labels
-			cur.UpdatedAt = nowUTC()
-			if err := tx.UpdateAsset(ctx, cur); err != nil {
-				return nil, fmt.Errorf("update asset %q: %w", y.Name, err)
-			}
-			r.AssetsUpdated++
-			out[y.Name] = cur.ID
-			continue
-		}
-		a, err := domain.NewAsset(productID, y.Name, domain.AssetType(y.Type), domain.Environment(y.Environment), copyLabels(y.Labels), y.Description)
-		if err != nil {
-			return nil, fmt.Errorf("build asset %q: %w", y.Name, err)
-		}
-		if err := tx.CreateAsset(ctx, a); err != nil {
-			return nil, fmt.Errorf("create asset %q: %w", y.Name, err)
-		}
-		r.AssetsAdded++
-		out[y.Name] = a.ID
+	if err := tx.CreateProduct(ctx, p); err != nil {
+		return nil, fmt.Errorf("create product: %w", err)
 	}
-
-	for _, cur := range existing {
-		if _, keep := desiredNames[cur.Name]; keep {
-			continue
-		}
-		if err := tx.DeleteAsset(ctx, cur.ID); err != nil {
-			return nil, fmt.Errorf("delete asset %q: %w", cur.Name, err)
-		}
-		r.AssetsDeleted++
-	}
-	return out, nil
-}
-
-func syncAssetScopes(ctx context.Context, tx storage.Storage, productID domain.ID, want []YAMLAssetScope, _ map[string]domain.ID, r *ImportResult) (map[string]domain.ID, error) {
-	existing, err := tx.ListAssetScopesByProduct(ctx, productID)
+	evt, err := domain.NewAuditEvent(domain.EventProductCreated, actor, "product", string(p.ID), map[string]any{
+		"name":  p.Name,
+		"owner": p.Owner,
+	})
 	if err != nil {
-		return nil, fmt.Errorf("list asset scopes: %w", err)
+		return nil, fmt.Errorf("build product.created audit: %w", err)
 	}
-	byName := indexByName(existing, func(s *domain.AssetScope) string { return s.Name })
-	desiredNames := make(map[string]struct{}, len(want))
-	out := make(map[string]domain.ID, len(want))
-
-	for _, y := range want {
-		desiredNames[y.Name] = struct{}{}
-		sel := domain.AssetSelector{
-			Type:        domain.AssetType(y.Selector.Type),
-			Environment: domain.Environment(y.Selector.Environment),
-			Labels:      copyLabels(y.Selector.Labels),
-			AssetNames:  append([]string(nil), y.AssetNames...),
-		}
-		if cur, ok := byName[y.Name]; ok {
-			if cur.Description == y.Description && selectorsEqual(cur.Selector, sel) {
-				out[y.Name] = cur.ID
-				continue
-			}
-			cur.Description = y.Description
-			cur.Selector = sel
-			cur.UpdatedAt = nowUTC()
-			if err := tx.UpdateAssetScope(ctx, cur); err != nil {
-				return nil, fmt.Errorf("update asset scope %q: %w", y.Name, err)
-			}
-			r.AssetScopesUpdated++
-			out[y.Name] = cur.ID
-			continue
-		}
-		s, err := domain.NewAssetScope(productID, y.Name, sel, y.Description)
-		if err != nil {
-			return nil, fmt.Errorf("build asset scope %q: %w", y.Name, err)
-		}
-		if err := tx.CreateAssetScope(ctx, s); err != nil {
-			return nil, fmt.Errorf("create asset scope %q: %w", y.Name, err)
-		}
-		r.AssetScopesAdded++
-		out[y.Name] = s.ID
+	if err := tx.AppendAuditEvent(ctx, evt); err != nil {
+		return nil, fmt.Errorf("append product.created audit: %w", err)
 	}
-
-	for _, cur := range existing {
-		if _, keep := desiredNames[cur.Name]; keep {
-			continue
-		}
-		if err := tx.DeleteAssetScope(ctx, cur.ID); err != nil {
-			return nil, fmt.Errorf("delete asset scope %q: %w", cur.Name, err)
-		}
-		r.AssetScopesDeleted++
-	}
-	return out, nil
+	return p, nil
 }
 
-func syncGlobalObjects(ctx context.Context, tx storage.Storage, productID *domain.ID, want []YAMLGlobalObject, r *ImportResult) (map[string]domain.ID, error) {
-	existing, err := tx.ListGlobalObjectsByProduct(ctx, productID)
+// loadParentVersion returns the latest approved version's id and reconstructed
+// model. Returns (nil, nil, nil) when there is no prior version.
+func loadParentVersion(ctx context.Context, tx storage.Storage, productID domain.ID) (*domain.ID, *ProductAuthorizationModel, error) {
+	av, snap, err := tx.GetLatestApprovedVersion(ctx, productID)
 	if err != nil {
-		return nil, fmt.Errorf("list global objects: %w", err)
+		if errors.Is(err, storage.ErrNotFound) {
+			return nil, nil, nil
+		}
+		return nil, nil, fmt.Errorf("get latest approved version: %w", err)
 	}
-	byName := indexByName(existing, func(g *domain.GlobalObject) string { return g.Name })
-	desiredNames := make(map[string]struct{}, len(want))
-	out := make(map[string]domain.ID, len(want))
-
-	for _, y := range want {
-		desiredNames[y.Name] = struct{}{}
-		if cur, ok := byName[y.Name]; ok {
-			if string(cur.Type) == y.Type && reflect.DeepEqual(cur.Spec, y.Spec) {
-				out[y.Name] = cur.ID
-				continue
-			}
-			cur.Type = domain.GlobalObjectType(y.Type)
-			cur.Spec = y.Spec
-			cur.UpdatedAt = nowUTC()
-			if err := tx.UpdateGlobalObject(ctx, cur); err != nil {
-				return nil, fmt.Errorf("update global object %q: %w", y.Name, err)
-			}
-			r.GlobalObjectsUpdated++
-			out[y.Name] = cur.ID
-			continue
-		}
-		g, err := domain.NewGlobalObject(y.Name, domain.GlobalObjectType(y.Type), productID, y.Spec)
-		if err != nil {
-			return nil, fmt.Errorf("build global object %q: %w", y.Name, err)
-		}
-		if err := tx.CreateGlobalObject(ctx, g); err != nil {
-			return nil, fmt.Errorf("create global object %q: %w", y.Name, err)
-		}
-		r.GlobalObjectsAdded++
-		out[y.Name] = g.ID
-	}
-
-	for _, cur := range existing {
-		if _, keep := desiredNames[cur.Name]; keep {
-			continue
-		}
-		if err := tx.DeleteGlobalObject(ctx, cur.ID); err != nil {
-			return nil, fmt.Errorf("delete global object %q: %w", cur.Name, err)
-		}
-		r.GlobalObjectsDeleted++
-	}
-	return out, nil
-}
-
-func syncEntitlements(ctx context.Context, tx storage.Storage, productID domain.ID, want []YAMLEntitlement, r *ImportResult) (map[string]domain.ID, error) {
-	existing, err := tx.ListEntitlementsByProduct(ctx, productID)
+	model, err := FromSnapshot(snap.Content)
 	if err != nil {
-		return nil, fmt.Errorf("list entitlements: %w", err)
+		return nil, nil, fmt.Errorf("decode snapshot: %w", err)
 	}
-	byName := indexByName(existing, func(e *domain.Entitlement) string { return e.Name })
-	desiredNames := make(map[string]struct{}, len(want))
-	out := make(map[string]domain.ID, len(want))
-
-	for _, y := range want {
-		desiredNames[y.Name] = struct{}{}
-		if cur, ok := byName[y.Name]; ok {
-			if cur.Owner == y.Owner && cur.Purpose == y.Purpose {
-				out[y.Name] = cur.ID
-				continue
-			}
-			cur.Owner = y.Owner
-			cur.Purpose = y.Purpose
-			cur.UpdatedAt = nowUTC()
-			if err := tx.UpdateEntitlement(ctx, cur); err != nil {
-				return nil, fmt.Errorf("update entitlement %q: %w", y.Name, err)
-			}
-			r.EntitlementsUpdated++
-			out[y.Name] = cur.ID
-			continue
-		}
-		e, err := domain.NewEntitlement(productID, y.Name, y.Owner, y.Purpose)
-		if err != nil {
-			return nil, fmt.Errorf("build entitlement %q: %w", y.Name, err)
-		}
-		if err := tx.CreateEntitlement(ctx, e); err != nil {
-			return nil, fmt.Errorf("create entitlement %q: %w", y.Name, err)
-		}
-		r.EntitlementsAdded++
-		out[y.Name] = e.ID
-	}
-
-	for _, cur := range existing {
-		if _, keep := desiredNames[cur.Name]; keep {
-			continue
-		}
-		if err := tx.DeleteEntitlement(ctx, cur.ID); err != nil {
-			return nil, fmt.Errorf("delete entitlement %q: %w", cur.Name, err)
-		}
-		r.EntitlementsDeleted++
-	}
-	return out, nil
+	id := av.ID
+	return &id, model, nil
 }
 
-func syncServiceAccounts(ctx context.Context, tx storage.Storage, productID domain.ID, want []YAMLServiceAccount, r *ImportResult) (map[string]domain.ID, error) {
-	existing, err := tx.ListServiceAccountsByProduct(ctx, productID)
+// createChangeSet writes a draft ChangeSet plus one ChangeSetItem per diff
+// entry, then emits changeset.created. No per-item audit events; the change
+// set itself is the audit unit at this layer.
+func createChangeSet(ctx context.Context, tx storage.Storage, product *domain.Product, m *ProductAuthorizationModel, parentVersionID *domain.ID, diff *Diff, actor domain.Actor) (*domain.ChangeSet, error) {
+	title := fmt.Sprintf("import %s %s", m.Metadata.Product, time.Now().UTC().Format(time.RFC3339))
+	description := m.Metadata.Description
+	if description == "" {
+		description = fmt.Sprintf("Imported from YAML; %s", diff.Summary())
+	}
+	cs, err := domain.NewChangeSet(product.ID, parentVersionID, title, description, actor)
 	if err != nil {
-		return nil, fmt.Errorf("list service accounts: %w", err)
+		return nil, fmt.Errorf("build change set: %w", err)
 	}
-	byName := indexByName(existing, func(s *domain.ServiceAccount) string { return s.Name })
-	desiredNames := make(map[string]struct{}, len(want))
-	out := make(map[string]domain.ID, len(want))
-
-	for _, y := range want {
-		desiredNames[y.Name] = struct{}{}
-		if cur, ok := byName[y.Name]; ok {
-			if cur.Owner == y.Owner && cur.Purpose == y.Purpose && string(cur.UsagePattern) == y.UsagePattern {
-				out[y.Name] = cur.ID
-				continue
-			}
-			cur.Owner = y.Owner
-			cur.Purpose = y.Purpose
-			cur.UsagePattern = domain.UsagePattern(y.UsagePattern)
-			cur.UpdatedAt = nowUTC()
-			if err := tx.UpdateServiceAccount(ctx, cur); err != nil {
-				return nil, fmt.Errorf("update service account %q: %w", y.Name, err)
-			}
-			r.ServiceAccountsUpdated++
-			out[y.Name] = cur.ID
-			continue
-		}
-		s, err := domain.NewServiceAccount(productID, y.Name, y.Owner, y.Purpose, domain.UsagePattern(y.UsagePattern))
-		if err != nil {
-			return nil, fmt.Errorf("build service account %q: %w", y.Name, err)
-		}
-		if err := tx.CreateServiceAccount(ctx, s); err != nil {
-			return nil, fmt.Errorf("create service account %q: %w", y.Name, err)
-		}
-		r.ServiceAccountsAdded++
-		out[y.Name] = s.ID
+	if err := tx.CreateChangeSet(ctx, cs); err != nil {
+		return nil, fmt.Errorf("create change set: %w", err)
 	}
-
-	for _, cur := range existing {
-		if _, keep := desiredNames[cur.Name]; keep {
-			continue
-		}
-		if err := tx.DeleteServiceAccount(ctx, cur.ID); err != nil {
-			return nil, fmt.Errorf("delete service account %q: %w", cur.Name, err)
-		}
-		r.ServiceAccountsDeleted++
-	}
-	return out, nil
-}
-
-// replaceAuthorizations deletes every authorization currently attached to the
-// parent and inserts the ones declared in YAML. Returns the number of new
-// rows inserted (which equals the post-import row count).
-func replaceAuthorizations(ctx context.Context, tx storage.Storage, parentKind domain.AuthorizationParentKind, parentID domain.ID, want []YAMLAuthorization, scopeIDs, globalIDs map[string]domain.ID) (int, error) {
-	existing, err := tx.ListAuthorizationsByParent(ctx, parentKind, parentID)
+	evt, err := domain.NewAuditEvent(domain.EventChangeSetCreated, actor, "change_set", string(cs.ID), map[string]any{
+		"product":  m.Metadata.Product,
+		"title":    cs.Title,
+		"summary":  diff.Summary(),
+		"items":    len(diff.Items),
+	})
 	if err != nil {
-		return 0, fmt.Errorf("list authorizations: %w", err)
+		return nil, fmt.Errorf("build changeset.created audit: %w", err)
 	}
-	for _, a := range existing {
-		if err := tx.DeleteAuthorization(ctx, a.ID); err != nil {
-			return 0, fmt.Errorf("delete authorization: %w", err)
-		}
+	if err := tx.AppendAuditEvent(ctx, evt); err != nil {
+		return nil, fmt.Errorf("append changeset.created audit: %w", err)
 	}
-	for i, y := range want {
-		var scopeID, globalID *domain.ID
-		if y.Scope != "" {
-			id, ok := scopeIDs[y.Scope]
-			if !ok {
-				return 0, fmt.Errorf("authorization %d: scope %q not found", i, y.Scope)
-			}
-			scopeID = &id
-		}
-		if y.GlobalObject != "" {
-			id, ok := globalIDs[y.GlobalObject]
-			if !ok {
-				return 0, fmt.Errorf("authorization %d: global object %q not found", i, y.GlobalObject)
-			}
-			globalID = &id
-		}
-		auth, err := domain.NewAuthorization(parentKind, parentID, domain.AuthorizationType(y.Type), scopeID, globalID, y.Spec)
+	for _, it := range diff.Items {
+		csi, err := domain.NewChangeSetItem(cs.ID, it.Kind, it.Action, it.ResourceName, it.Before, it.After)
 		if err != nil {
-			return 0, fmt.Errorf("build authorization %d: %w", i, err)
+			return nil, fmt.Errorf("build change set item %q: %w", it.ResourceName, err)
 		}
-		if err := tx.CreateAuthorization(ctx, auth); err != nil {
-			return 0, fmt.Errorf("create authorization %d: %w", i, err)
-		}
-	}
-	return len(want), nil
-}
-
-// indexByName builds a name->row map. Names already validated to be unique.
-func indexByName[T any](rows []T, name func(T) string) map[string]T {
-	out := make(map[string]T, len(rows))
-	for _, r := range rows {
-		out[name(r)] = r
-	}
-	return out
-}
-
-// labelsEqual is true when both maps have the same key/value pairs. nil and
-// empty are equivalent.
-func labelsEqual(a, b map[string]string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for k, v := range a {
-		if bv, ok := b[k]; !ok || bv != v {
-			return false
+		if err := tx.AppendChangeSetItem(ctx, csi); err != nil {
+			return nil, fmt.Errorf("append change set item %q: %w", it.ResourceName, err)
 		}
 	}
-	return true
+	return cs, nil
 }
 
-// selectorsEqual compares two AssetSelectors structurally (asset name order
-// matters, but we sort below to ignore reorderings produced by the database).
-func selectorsEqual(a, b domain.AssetSelector) bool {
-	if a.Type != b.Type || a.Environment != b.Environment {
-		return false
+// autoApprove walks the freshly-created ChangeSet through Submitted -> Approved,
+// records the approval, mints the ApprovedVersion + snapshot, and applies the
+// snapshot to live tables. Audit events fire for each transition.
+func autoApprove(ctx context.Context, tx storage.Storage, productID domain.ID, m *ProductAuthorizationModel, cs *domain.ChangeSet, parentVersionID *domain.ID, actor domain.Actor) (domain.ID, error) {
+	now := time.Now().UTC()
+
+	if err := tx.UpdateChangeSetState(ctx, cs.ID, domain.ChangeSetStateSubmitted, &now, ""); err != nil {
+		return "", fmt.Errorf("transition to submitted: %w", err)
 	}
-	if !labelsEqual(a.Labels, b.Labels) {
-		return false
+	if err := emitChangeSetEvent(ctx, tx, domain.EventChangeSetSubmitted, cs.ID, actor, nil); err != nil {
+		return "", err
 	}
-	an := append([]string(nil), a.AssetNames...)
-	bn := append([]string(nil), b.AssetNames...)
-	sort.Strings(an)
-	sort.Strings(bn)
-	if len(an) != len(bn) {
-		return false
+
+	seq, err := tx.NextSequenceForProduct(ctx, productID)
+	if err != nil {
+		return "", fmt.Errorf("next sequence: %w", err)
 	}
-	for i := range an {
-		if an[i] != bn[i] {
-			return false
-		}
+	content, err := ToSnapshotContent(m)
+	if err != nil {
+		return "", fmt.Errorf("snapshot content: %w", err)
 	}
-	return true
+	snap, err := domain.NewApprovedVersionSnapshot(content)
+	if err != nil {
+		return "", fmt.Errorf("build snapshot: %w", err)
+	}
+	av, err := domain.NewApprovedVersion(productID, snap.ID, seq, parentVersionID, cs.ID, actor, "auto-approved")
+	if err != nil {
+		return "", fmt.Errorf("build approved version: %w", err)
+	}
+	if err := tx.CreateApprovedVersion(ctx, av, snap); err != nil {
+		return "", fmt.Errorf("create approved version: %w", err)
+	}
+	if err := emitApprovedVersionEvent(ctx, tx, av, actor); err != nil {
+		return "", err
+	}
+
+	if err := tx.UpdateChangeSetState(ctx, cs.ID, domain.ChangeSetStateApproved, &now, "auto-approve"); err != nil {
+		return "", fmt.Errorf("transition to approved: %w", err)
+	}
+	if err := emitChangeSetEvent(ctx, tx, domain.EventChangeSetApproved, cs.ID, actor, map[string]any{
+		"approved_version_id": string(av.ID),
+		"sequence":            av.Sequence,
+	}); err != nil {
+		return "", err
+	}
+	approval, err := domain.NewApproval(cs.ID, actor, domain.ApprovalDecisionApproved, "auto-approve")
+	if err != nil {
+		return "", fmt.Errorf("build approval: %w", err)
+	}
+	if err := tx.CreateApproval(ctx, approval); err != nil {
+		return "", fmt.Errorf("create approval: %w", err)
+	}
+
+	if _, err := applyInTx(ctx, tx, productID, m, actor); err != nil {
+		return "", fmt.Errorf("apply: %w", err)
+	}
+	return av.ID, nil
 }
 
-// copyLabels returns a defensive copy; nil maps stay nil so reflect-deep-equal
-// stays well-behaved for empty selectors.
-func copyLabels(in map[string]string) map[string]string {
-	if in == nil {
-		return nil
+// emitChangeSetEvent appends a single changeset.* audit event with optional
+// extra payload fields merged on top of the change-set id.
+func emitChangeSetEvent(ctx context.Context, tx storage.Storage, kind domain.EventKind, csID domain.ID, actor domain.Actor, extra map[string]any) error {
+	payload := map[string]any{"change_set_id": string(csID)}
+	for k, v := range extra {
+		payload[k] = v
 	}
-	out := make(map[string]string, len(in))
-	for k, v := range in {
-		out[k] = v
+	evt, err := domain.NewAuditEvent(kind, actor, "change_set", string(csID), payload)
+	if err != nil {
+		return fmt.Errorf("build %s audit: %w", kind, err)
 	}
-	return out
+	if err := tx.AppendAuditEvent(ctx, evt); err != nil {
+		return fmt.Errorf("append %s audit: %w", kind, err)
+	}
+	return nil
+}
+
+// emitApprovedVersionEvent appends an approved_version.created audit event.
+func emitApprovedVersionEvent(ctx context.Context, tx storage.Storage, av *domain.ApprovedVersion, actor domain.Actor) error {
+	payload := map[string]any{
+		"approved_version_id": string(av.ID),
+		"product_id":          string(av.ProductID),
+		"sequence":            av.Sequence,
+		"snapshot_id":         string(av.SnapshotID),
+		"source_change_set":   string(av.SourceChangeSetID),
+	}
+	evt, err := domain.NewAuditEvent(domain.EventApprovedVersionCreated, actor, "approved_version", string(av.ID), payload)
+	if err != nil {
+		return fmt.Errorf("build approved_version.created audit: %w", err)
+	}
+	if err := tx.AppendAuditEvent(ctx, evt); err != nil {
+		return fmt.Errorf("append approved_version.created audit: %w", err)
+	}
+	return nil
+}
+
+// applyInTx invokes Apply against the in-transaction storage handle by
+// delegating to a wrapper that no-ops the inner WithTx (we are already inside
+// one). Apply itself opens its own tx via the storage handle it receives, but
+// pgx tx handles route nested WithTx as a savepoint or pass-through depending
+// on the implementation. To stay portable we call the apply logic directly.
+func applyInTx(ctx context.Context, tx storage.Storage, productID domain.ID, m *ProductAuthorizationModel, actor domain.Actor) (*ApplyResult, error) {
+	return Apply(ctx, txPassthrough{Storage: tx}, productID, m, actor)
+}
+
+// txPassthrough wraps a Storage already inside a transaction so a nested
+// WithTx call runs fn against the same handle without opening a new tx. This
+// keeps Apply's "atomic with audit events" promise intact when called from
+// inside Import's outer tx.
+type txPassthrough struct {
+	storage.Storage
+}
+
+// WithTx ignores the request to open a new tx and runs fn against the
+// underlying handle, which is already transactional.
+func (t txPassthrough) WithTx(ctx context.Context, fn func(tx storage.Storage) error) error {
+	return fn(t.Storage)
 }

@@ -73,6 +73,9 @@ func init() {
 	addProductCmd(rootCmd)
 	addModelCmd(rootCmd)
 	addValidateCmd(rootCmd)
+	addApprovalCmd(rootCmd)
+	addDiffCmd(rootCmd)
+	addAuditCmd(rootCmd)
 	addAgentCmd(rootCmd)
 	addInferenceCmd(rootCmd)
 }

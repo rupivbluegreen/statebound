@@ -55,4 +55,41 @@ var (
 	statusErrorStyle = lipgloss.NewStyle().
 				Foreground(lipgloss.Color("196")).
 				Padding(0, 1)
+
+	// ChangeSet state badge styles. Colours mirror the spec: Draft dim,
+	// Submitted yellow, Approved green, Rejected red, Conflicted red with
+	// strikethrough so reviewers can spot superseded approvals at a glance.
+	draftStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("244"))
+
+	submittedStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("214")).
+			Bold(true)
+
+	approvedStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("76")).
+			Bold(true)
+
+	rejectedStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("196")).
+			Bold(true)
+
+	conflictedStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("196")).
+			Bold(true).
+			Strikethrough(true)
+
+	// Diff sign styles, used by RenderDiffItems and the change-set detail
+	// inline diff view.
+	addStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("76")).
+			Bold(true)
+
+	deleteStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("196")).
+			Bold(true)
+
+	updateStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("214")).
+			Bold(true)
 )

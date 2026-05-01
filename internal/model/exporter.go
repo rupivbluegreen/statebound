@@ -2,8 +2,11 @@ package model
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sort"
+
+	"gopkg.in/yaml.v3"
 
 	"statebound.dev/statebound/internal/domain"
 	"statebound.dev/statebound/internal/storage"
@@ -185,4 +188,48 @@ func authSortKey(a *domain.Authorization, scopeNames, globalNames map[domain.ID]
 		return "global:" + globalNames[*a.GlobalObjectID]
 	}
 	return ""
+}
+
+// ToSnapshotContent serializes a model into a generic map[string]any suitable
+// for ApprovedVersionSnapshot.Content. We round-trip via YAML so the custom
+// Marshal/Unmarshal hooks on YAMLAuthorization etc. take effect, then through
+// JSON to land on JSON-native primitives (map[string]any, []any, string,
+// float64, bool). The output is deterministic for any deterministic input.
+func ToSnapshotContent(m *ProductAuthorizationModel) (map[string]any, error) {
+	if m == nil {
+		return nil, fmt.Errorf("model: ToSnapshotContent: nil model")
+	}
+	yamlBytes, err := yaml.Marshal(m)
+	if err != nil {
+		return nil, fmt.Errorf("model: ToSnapshotContent: marshal yaml: %w", err)
+	}
+	var raw any
+	if err := yaml.Unmarshal(yamlBytes, &raw); err != nil {
+		return nil, fmt.Errorf("model: ToSnapshotContent: unmarshal yaml: %w", err)
+	}
+	normalized := normalizeMapKeys(raw)
+	out, ok := normalized.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("model: ToSnapshotContent: unexpected top-level shape")
+	}
+	return out, nil
+}
+
+// FromSnapshot rebuilds a ProductAuthorizationModel from snapshot content
+// produced by ToSnapshotContent. JSON->bytes->YAML lands the data through the
+// YAML decoder so custom Unmarshal hooks reconstitute YAMLAssetSelector and
+// YAMLAuthorization correctly.
+func FromSnapshot(content map[string]any) (*ProductAuthorizationModel, error) {
+	if content == nil {
+		return nil, fmt.Errorf("model: FromSnapshot: nil content")
+	}
+	jsonBytes, err := json.Marshal(content)
+	if err != nil {
+		return nil, fmt.Errorf("model: FromSnapshot: marshal json: %w", err)
+	}
+	out := &ProductAuthorizationModel{}
+	if err := yaml.Unmarshal(jsonBytes, out); err != nil {
+		return nil, fmt.Errorf("model: FromSnapshot: unmarshal yaml: %w", err)
+	}
+	return out, nil
 }

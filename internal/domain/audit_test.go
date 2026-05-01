@@ -12,6 +12,8 @@ func validActor() Actor {
 
 func TestNewAuditEvent_Valid(t *testing.T) {
 	kinds := []EventKind{
+		EventApprovalRecorded,
+		EventApprovedVersionCreated,
 		EventAssetCreated,
 		EventAssetDeleted,
 		EventAssetScopeCreated,
@@ -21,6 +23,11 @@ func TestNewAuditEvent_Valid(t *testing.T) {
 		EventAuthorizationCreated,
 		EventAuthorizationDeleted,
 		EventAuthorizationUpdated,
+		EventChangeSetApproved,
+		EventChangeSetConflicted,
+		EventChangeSetCreated,
+		EventChangeSetRejected,
+		EventChangeSetSubmitted,
 		EventEntitlementCreated,
 		EventEntitlementDeleted,
 		EventEntitlementUpdated,
@@ -195,6 +202,13 @@ func TestEventKind_Values(t *testing.T) {
 		EventProductUpdated:        "product.updated",
 		EventProductDeleted:        "product.deleted",
 		EventModelImported:         "model.imported",
+		EventChangeSetCreated:      "changeset.created",
+		EventChangeSetSubmitted:    "changeset.submitted",
+		EventChangeSetApproved:     "changeset.approved",
+		EventChangeSetRejected:     "changeset.rejected",
+		EventChangeSetConflicted:   "changeset.conflicted",
+		EventApprovalRecorded:      "approval.recorded",
+		EventApprovedVersionCreated: "approved_version.created",
 	}
 	for k, want := range cases {
 		if string(k) != want {

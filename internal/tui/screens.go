@@ -2,6 +2,8 @@ package tui
 
 import (
 	tea "github.com/charmbracelet/bubbletea"
+
+	"statebound.dev/statebound/internal/domain"
 )
 
 // screen is the contract every navigable view in the TUI implements.
@@ -45,3 +47,29 @@ type pushScreenMsg struct{ s screen }
 
 // popScreenMsg asks the top-level Model to pop the active screen off the stack.
 type popScreenMsg struct{}
+
+// changeSetsLoadedMsg carries the result of an async ListChangeSets query.
+// scope distinguishes the all-states list from the submitted-only list so a
+// shared message type does not cross-pollinate the two screens.
+type changeSetsLoadedMsg struct {
+	scope      string
+	changeSets []*domain.ChangeSet
+}
+
+// changeSetItemsLoadedMsg carries the items list for a specific ChangeSet.
+type changeSetItemsLoadedMsg struct {
+	changeSetID domain.ID
+	items       []*domain.ChangeSetItem
+}
+
+// approvalsLoadedMsg carries the approval records for a specific ChangeSet.
+type approvalsLoadedMsg struct {
+	changeSetID domain.ID
+	approvals   []*domain.Approval
+}
+
+// productNamesLoadedMsg carries a productID -> Name lookup for cosmetic
+// rendering (e.g. the change sets list shows product names, not UUIDs).
+type productNamesLoadedMsg struct {
+	names map[domain.ID]string
+}

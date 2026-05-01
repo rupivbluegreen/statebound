@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -278,20 +279,55 @@ func scanProduct(r scannable) (*domain.Product, error) {
 
 const auditColumns = "id, kind, actor_kind, actor_subject, resource_type, resource_id, payload, occurred_at, prev_hash, hash"
 
-// AppendAuditEvent inserts an audit event. Hash chain fields are written verbatim
-// (empty strings in Phase 0; populated from v0.2 onward).
+// AppendAuditEvent inserts an audit event with a freshly computed hash-chain
+// link. From v0.2 onward every event participates in the chain.
+//
+// Hash-chain definition (must match migrations/0003_changesets.sql exactly):
+//
+//	prev = (SELECT hash FROM audit_events ORDER BY occurred_at DESC, id DESC LIMIT 1)
+//	hash = sha256_hex( concat_ws('|',
+//	    prev,
+//	    kind,
+//	    actor_kind,
+//	    actor_subject,
+//	    resource_type,
+//	    resource_id,
+//	    payload::text,           -- Postgres jsonb -> text (sorted keys)
+//	    occurred_at::text        -- Postgres timestamptz -> text
+//	) )
+//
+// The hash is computed inside the same INSERT statement using the audit_event_hash
+// SQL function, so Go and SQL agree by construction. The new prev_hash and hash
+// values are read back into e via RETURNING.
 func (s *Store) AppendAuditEvent(ctx context.Context, e *domain.AuditEvent) error {
 	payload, err := marshalJSON(e.Payload)
 	if err != nil {
 		return err
 	}
+
+	// Read the chain tip. With a single concurrent writer this is consistent;
+	// the unique-violation path is not used here because audit ids are UUIDs.
+	var prev string
+	const tipQ = `SELECT COALESCE(
+        (SELECT hash FROM audit_events ORDER BY occurred_at DESC, id DESC LIMIT 1),
+        ''
+    )`
+	if err := s.q.QueryRow(ctx, tipQ).Scan(&prev); err != nil {
+		return fmt.Errorf("postgres: read audit chain tip: %w", err)
+	}
+
 	const q = `
 INSERT INTO audit_events (
   id, kind, actor_kind, actor_subject, resource_type, resource_id,
   payload, occurred_at, prev_hash, hash
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+) VALUES (
+  $1, $2, $3, $4, $5, $6,
+  $7::jsonb, $8, $9,
+  audit_event_hash($9, $2, $3, $4, $5, $6, $7::jsonb, $8)
+)
+RETURNING prev_hash, hash
 `
-	_, err = s.q.Exec(ctx, q,
+	row := s.q.QueryRow(ctx, q,
 		string(e.ID),
 		string(e.Kind),
 		string(e.Actor.Kind),
@@ -300,10 +336,9 @@ INSERT INTO audit_events (
 		e.ResourceID,
 		payload,
 		e.OccurredAt,
-		e.PrevHash,
-		e.Hash,
+		prev,
 	)
-	if err != nil {
+	if err := row.Scan(&e.PrevHash, &e.Hash); err != nil {
 		if isUniqueViolation(err) {
 			return storage.ErrAlreadyExists
 		}
@@ -1198,6 +1233,668 @@ func scanAuthorization(r scannable) (*domain.Authorization, error) {
 		}
 	}
 	return &a, nil
+}
+
+// -------- Change sets --------
+
+const changeSetColumns = "id, product_id, state, parent_approved_version_id, title, description, " +
+	"requested_by_kind, requested_by_subject, submitted_at, decided_at, decision_reason, created_at, updated_at"
+
+// nullableJSONParam returns a value safe to bind to a JSONB column that allows
+// NULL. A nil map encodes as SQL NULL; a non-nil map encodes as canonical JSON
+// bytes (which Postgres accepts for jsonb).
+func nullableJSONParam(m map[string]any) (any, error) {
+	if m == nil {
+		return nil, nil
+	}
+	b, err := json.Marshal(m)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: encode nullable json: %w", err)
+	}
+	return b, nil
+}
+
+// CreateChangeSet inserts a new change_sets row.
+func (s *Store) CreateChangeSet(ctx context.Context, cs *domain.ChangeSet) error {
+	if cs == nil {
+		return storage.ErrInvalidArgument
+	}
+	const q = `
+INSERT INTO change_sets (
+  id, product_id, state, parent_approved_version_id, title, description,
+  requested_by_kind, requested_by_subject, submitted_at, decided_at, decision_reason,
+  created_at, updated_at
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+`
+	_, err := s.q.Exec(ctx, q,
+		string(cs.ID),
+		string(cs.ProductID),
+		string(cs.State),
+		idPtrToParam(cs.ParentApprovedVersionID),
+		cs.Title,
+		cs.Description,
+		string(cs.RequestedBy.Kind),
+		cs.RequestedBy.Subject,
+		cs.SubmittedAt,
+		cs.DecidedAt,
+		cs.DecisionReason,
+		cs.CreatedAt,
+		cs.UpdatedAt,
+	)
+	if err != nil {
+		if isUniqueViolation(err) {
+			return storage.ErrAlreadyExists
+		}
+		return fmt.Errorf("postgres: insert change_set: %w", classifyErr(err))
+	}
+	return nil
+}
+
+// GetChangeSetByID returns a change set by primary key.
+func (s *Store) GetChangeSetByID(ctx context.Context, id domain.ID) (*domain.ChangeSet, error) {
+	if id == "" {
+		return nil, storage.ErrInvalidArgument
+	}
+	const q = `SELECT ` + changeSetColumns + ` FROM change_sets WHERE id = $1`
+	return scanChangeSet(s.q.QueryRow(ctx, q, string(id)))
+}
+
+// ListChangeSets returns change sets matching filter, newest first.
+func (s *Store) ListChangeSets(ctx context.Context, f storage.ChangeSetFilter) ([]*domain.ChangeSet, error) {
+	q := `SELECT ` + changeSetColumns + ` FROM change_sets`
+	args := make([]any, 0, 3)
+	clauses := make([]string, 0, 2)
+
+	if f.ProductID != nil {
+		args = append(args, string(*f.ProductID))
+		clauses = append(clauses, fmt.Sprintf("product_id = $%d", len(args)))
+	}
+	if f.State != nil {
+		args = append(args, string(*f.State))
+		clauses = append(clauses, fmt.Sprintf("state = $%d", len(args)))
+	}
+	if len(clauses) > 0 {
+		q += " WHERE " + joinAnd(clauses)
+	}
+	q += " ORDER BY created_at DESC, id ASC"
+	if f.Limit > 0 {
+		args = append(args, f.Limit)
+		q += fmt.Sprintf(" LIMIT $%d", len(args))
+	}
+
+	rows, err := s.q.Query(ctx, q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: list change_sets: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]*domain.ChangeSet, 0)
+	for rows.Next() {
+		cs, err := scanChangeSet(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, cs)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("postgres: iterate change_sets: %w", err)
+	}
+	return out, nil
+}
+
+// UpdateChangeSetState transitions a change set's lifecycle state. Callers
+// pre-validate the transition via domain.ChangeSetState.CanTransitionTo;
+// this method enforces no SQL-level state-machine. It updates submitted_at
+// implicitly when newState == 'submitted' and decided_at when newState is a
+// terminal state. Returns ErrNotFound if no row matches id.
+func (s *Store) UpdateChangeSetState(ctx context.Context, id domain.ID, newState domain.ChangeSetState, decidedAt *time.Time, decisionReason string) error {
+	if id == "" {
+		return storage.ErrInvalidArgument
+	}
+	now := time.Now().UTC()
+
+	// Decide which timestamp column to populate. Submitted -> submitted_at.
+	// Approved/rejected/conflicted -> decided_at. Draft -> neither.
+	var (
+		setSubmittedAt *time.Time
+		setDecidedAt   *time.Time
+	)
+	switch newState {
+	case domain.ChangeSetStateSubmitted:
+		t := now
+		if decidedAt != nil {
+			t = decidedAt.UTC()
+		}
+		setSubmittedAt = &t
+	case domain.ChangeSetStateApproved,
+		domain.ChangeSetStateRejected,
+		domain.ChangeSetStateConflicted:
+		t := now
+		if decidedAt != nil {
+			t = decidedAt.UTC()
+		}
+		setDecidedAt = &t
+	}
+
+	const q = `
+UPDATE change_sets
+   SET state           = $2,
+       submitted_at    = COALESCE($3, submitted_at),
+       decided_at      = COALESCE($4, decided_at),
+       decision_reason = CASE WHEN $5 <> '' THEN $5 ELSE decision_reason END,
+       updated_at      = $6
+ WHERE id = $1
+`
+	tag, err := s.q.Exec(ctx, q,
+		string(id),
+		string(newState),
+		setSubmittedAt,
+		setDecidedAt,
+		decisionReason,
+		now,
+	)
+	if err != nil {
+		return fmt.Errorf("postgres: update change_set state: %w", classifyErr(err))
+	}
+	if tag.RowsAffected() == 0 {
+		return storage.ErrNotFound
+	}
+	return nil
+}
+
+// AppendChangeSetItem inserts an item under an existing change set.
+func (s *Store) AppendChangeSetItem(ctx context.Context, item *domain.ChangeSetItem) error {
+	if item == nil {
+		return storage.ErrInvalidArgument
+	}
+	beforeParam, err := nullableJSONParam(item.Before)
+	if err != nil {
+		return err
+	}
+	afterParam, err := nullableJSONParam(item.After)
+	if err != nil {
+		return err
+	}
+	const q = `
+INSERT INTO change_set_items (
+  id, change_set_id, kind, action, resource_name, before, after, created_at
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+`
+	_, err = s.q.Exec(ctx, q,
+		string(item.ID),
+		string(item.ChangeSetID),
+		string(item.Kind),
+		string(item.Action),
+		item.ResourceName,
+		beforeParam,
+		afterParam,
+		item.CreatedAt,
+	)
+	if err != nil {
+		if isUniqueViolation(err) {
+			return storage.ErrAlreadyExists
+		}
+		return fmt.Errorf("postgres: insert change_set_item: %w", classifyErr(err))
+	}
+	return nil
+}
+
+// ListChangeSetItems returns every item under csID, ordered by created_at ASC.
+func (s *Store) ListChangeSetItems(ctx context.Context, csID domain.ID) ([]*domain.ChangeSetItem, error) {
+	if csID == "" {
+		return nil, storage.ErrInvalidArgument
+	}
+	const q = `
+SELECT id, change_set_id, kind, action, resource_name, before, after, created_at
+  FROM change_set_items
+ WHERE change_set_id = $1
+ ORDER BY created_at ASC, id ASC
+`
+	rows, err := s.q.Query(ctx, q, string(csID))
+	if err != nil {
+		return nil, fmt.Errorf("postgres: list change_set_items: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]*domain.ChangeSetItem, 0)
+	for rows.Next() {
+		it, err := scanChangeSetItem(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, it)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("postgres: iterate change_set_items: %w", err)
+	}
+	return out, nil
+}
+
+func scanChangeSet(r scannable) (*domain.ChangeSet, error) {
+	var (
+		id, productID, state              string
+		parentApprovedVersionID           *string
+		title, description                string
+		requestedByKind, requestedBySubj  string
+		submittedAt, decidedAt            *time.Time
+		decisionReason                    string
+		createdAt, updatedAt              time.Time
+	)
+	err := r.Scan(
+		&id, &productID, &state,
+		&parentApprovedVersionID,
+		&title, &description,
+		&requestedByKind, &requestedBySubj,
+		&submittedAt, &decidedAt,
+		&decisionReason,
+		&createdAt, &updatedAt,
+	)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, storage.ErrNotFound
+		}
+		return nil, fmt.Errorf("postgres: scan change_set: %w", err)
+	}
+	return &domain.ChangeSet{
+		ID:                      domain.ID(id),
+		ProductID:               domain.ID(productID),
+		State:                   domain.ChangeSetState(state),
+		ParentApprovedVersionID: nullableID(parentApprovedVersionID),
+		Title:                   title,
+		Description:             description,
+		RequestedBy: domain.Actor{
+			Kind:    domain.ActorKind(requestedByKind),
+			Subject: requestedBySubj,
+		},
+		SubmittedAt:    submittedAt,
+		DecidedAt:      decidedAt,
+		DecisionReason: decisionReason,
+		CreatedAt:      createdAt,
+		UpdatedAt:      updatedAt,
+	}, nil
+}
+
+func scanChangeSetItem(r scannable) (*domain.ChangeSetItem, error) {
+	var (
+		id, csID, kind, action string
+		resourceName           string
+		beforeRaw, afterRaw    []byte
+		createdAt              time.Time
+	)
+	err := r.Scan(&id, &csID, &kind, &action, &resourceName, &beforeRaw, &afterRaw, &createdAt)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, storage.ErrNotFound
+		}
+		return nil, fmt.Errorf("postgres: scan change_set_item: %w", err)
+	}
+	it := &domain.ChangeSetItem{
+		ID:           domain.ID(id),
+		ChangeSetID:  domain.ID(csID),
+		Kind:         domain.ChangeSetItemKind(kind),
+		Action:       domain.ChangeSetAction(action),
+		ResourceName: resourceName,
+		CreatedAt:    createdAt,
+	}
+	if len(beforeRaw) > 0 {
+		if err := json.Unmarshal(beforeRaw, &it.Before); err != nil {
+			return nil, fmt.Errorf("postgres: decode change_set_item before: %w", err)
+		}
+	}
+	if len(afterRaw) > 0 {
+		if err := json.Unmarshal(afterRaw, &it.After); err != nil {
+			return nil, fmt.Errorf("postgres: decode change_set_item after: %w", err)
+		}
+	}
+	return it, nil
+}
+
+// -------- Approvals --------
+
+const approvalColumns = "id, change_set_id, approver_kind, approver_subject, decision, reason, decided_at"
+
+// CreateApproval inserts a new approvals row.
+func (s *Store) CreateApproval(ctx context.Context, a *domain.Approval) error {
+	if a == nil {
+		return storage.ErrInvalidArgument
+	}
+	const q = `
+INSERT INTO approvals (id, change_set_id, approver_kind, approver_subject, decision, reason, decided_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7)
+`
+	_, err := s.q.Exec(ctx, q,
+		string(a.ID),
+		string(a.ChangeSetID),
+		string(a.Approver.Kind),
+		a.Approver.Subject,
+		string(a.Decision),
+		a.Reason,
+		a.DecidedAt,
+	)
+	if err != nil {
+		if isUniqueViolation(err) {
+			return storage.ErrAlreadyExists
+		}
+		return fmt.Errorf("postgres: insert approval: %w", classifyErr(err))
+	}
+	return nil
+}
+
+// ListApprovalsByChangeSet returns approvals for csID, newest first.
+func (s *Store) ListApprovalsByChangeSet(ctx context.Context, csID domain.ID) ([]*domain.Approval, error) {
+	if csID == "" {
+		return nil, storage.ErrInvalidArgument
+	}
+	const q = `
+SELECT ` + approvalColumns + `
+  FROM approvals
+ WHERE change_set_id = $1
+ ORDER BY decided_at DESC, id ASC
+`
+	rows, err := s.q.Query(ctx, q, string(csID))
+	if err != nil {
+		return nil, fmt.Errorf("postgres: list approvals: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]*domain.Approval, 0)
+	for rows.Next() {
+		a, err := scanApproval(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("postgres: iterate approvals: %w", err)
+	}
+	return out, nil
+}
+
+func scanApproval(r scannable) (*domain.Approval, error) {
+	var (
+		id, csID, approverKind, approverSubj, decision, reason string
+		decidedAt                                              time.Time
+	)
+	err := r.Scan(&id, &csID, &approverKind, &approverSubj, &decision, &reason, &decidedAt)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, storage.ErrNotFound
+		}
+		return nil, fmt.Errorf("postgres: scan approval: %w", err)
+	}
+	return &domain.Approval{
+		ID:          domain.ID(id),
+		ChangeSetID: domain.ID(csID),
+		Approver: domain.Actor{
+			Kind:    domain.ActorKind(approverKind),
+			Subject: approverSubj,
+		},
+		Decision:  domain.ApprovalDecision(decision),
+		Reason:    reason,
+		DecidedAt: decidedAt,
+	}, nil
+}
+
+// -------- Approved versions --------
+
+const approvedVersionColumns = "id, product_id, sequence, parent_version_id, source_change_set_id, " +
+	"snapshot_id, approved_by_kind, approved_by_subject, description, created_at"
+
+const approvedVersionSnapshotColumns = "id, content, content_hash, created_at"
+
+// CreateApprovedVersion atomically inserts the snapshot and the version that
+// references it. If a snapshot with the same content_hash already exists its
+// row is reused (snap.ID is rewritten to the existing id). Both writes happen
+// inside a tx; if s.q is already a tx the existing tx is used, otherwise a
+// short-lived local tx wraps both inserts.
+func (s *Store) CreateApprovedVersion(ctx context.Context, av *domain.ApprovedVersion, snap *domain.ApprovedVersionSnapshot) error {
+	if av == nil || snap == nil {
+		return storage.ErrInvalidArgument
+	}
+	if s.pool == nil {
+		// already inside a tx
+		return s.createApprovedVersion(ctx, av, snap)
+	}
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return fmt.Errorf("postgres: begin approved version tx: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+	sub := &Store{pool: nil, q: tx}
+	if err := sub.createApprovedVersion(ctx, av, snap); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("postgres: commit approved version tx: %w", err)
+	}
+	committed = true
+	return nil
+}
+
+func (s *Store) createApprovedVersion(ctx context.Context, av *domain.ApprovedVersion, snap *domain.ApprovedVersionSnapshot) error {
+	contentBytes, err := json.Marshal(snap.Content)
+	if err != nil {
+		return fmt.Errorf("postgres: encode snapshot content: %w", err)
+	}
+
+	// Insert-or-reuse on content_hash. ON CONFLICT does nothing; a follow-up
+	// SELECT picks up the canonical id and timestamp regardless of which path
+	// we took.
+	const upsertSnap = `
+INSERT INTO approved_version_snapshots (id, content, content_hash, created_at)
+VALUES ($1, $2::jsonb, $3, $4)
+ON CONFLICT (content_hash) DO NOTHING
+`
+	if _, err := s.q.Exec(ctx, upsertSnap,
+		string(snap.ID), contentBytes, snap.ContentHash, snap.CreatedAt,
+	); err != nil {
+		return fmt.Errorf("postgres: upsert approved_version_snapshot: %w", classifyErr(err))
+	}
+
+	const fetchSnap = `SELECT id, created_at FROM approved_version_snapshots WHERE content_hash = $1`
+	var (
+		canonicalID string
+		canonicalAt time.Time
+	)
+	if err := s.q.QueryRow(ctx, fetchSnap, snap.ContentHash).Scan(&canonicalID, &canonicalAt); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return storage.ErrNotFound
+		}
+		return fmt.Errorf("postgres: fetch approved_version_snapshot: %w", err)
+	}
+	snap.ID = domain.ID(canonicalID)
+	snap.CreatedAt = canonicalAt
+	av.SnapshotID = snap.ID
+
+	const insertVersion = `
+INSERT INTO approved_versions (
+  id, product_id, sequence, parent_version_id, source_change_set_id, snapshot_id,
+  approved_by_kind, approved_by_subject, description, created_at
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+`
+	if _, err := s.q.Exec(ctx, insertVersion,
+		string(av.ID),
+		string(av.ProductID),
+		av.Sequence,
+		idPtrToParam(av.ParentVersionID),
+		string(av.SourceChangeSetID),
+		string(av.SnapshotID),
+		string(av.ApprovedBy.Kind),
+		av.ApprovedBy.Subject,
+		av.Description,
+		av.CreatedAt,
+	); err != nil {
+		if isUniqueViolation(err) {
+			return storage.ErrAlreadyExists
+		}
+		return fmt.Errorf("postgres: insert approved_version: %w", classifyErr(err))
+	}
+	return nil
+}
+
+// GetLatestApprovedVersion returns the highest-sequence approved version for
+// productID and its snapshot. ErrNotFound if the product has none.
+func (s *Store) GetLatestApprovedVersion(ctx context.Context, productID domain.ID) (*domain.ApprovedVersion, *domain.ApprovedVersionSnapshot, error) {
+	if productID == "" {
+		return nil, nil, storage.ErrInvalidArgument
+	}
+	const q = `
+SELECT ` + approvedVersionColumns + `
+  FROM approved_versions
+ WHERE product_id = $1
+ ORDER BY sequence DESC
+ LIMIT 1
+`
+	av, err := scanApprovedVersion(s.q.QueryRow(ctx, q, string(productID)))
+	if err != nil {
+		return nil, nil, err
+	}
+	snap, err := s.getSnapshotByID(ctx, av.SnapshotID)
+	if err != nil {
+		return nil, nil, err
+	}
+	return av, snap, nil
+}
+
+// GetApprovedVersionByID returns one approved version and its snapshot.
+func (s *Store) GetApprovedVersionByID(ctx context.Context, id domain.ID) (*domain.ApprovedVersion, *domain.ApprovedVersionSnapshot, error) {
+	if id == "" {
+		return nil, nil, storage.ErrInvalidArgument
+	}
+	const q = `SELECT ` + approvedVersionColumns + ` FROM approved_versions WHERE id = $1`
+	av, err := scanApprovedVersion(s.q.QueryRow(ctx, q, string(id)))
+	if err != nil {
+		return nil, nil, err
+	}
+	snap, err := s.getSnapshotByID(ctx, av.SnapshotID)
+	if err != nil {
+		return nil, nil, err
+	}
+	return av, snap, nil
+}
+
+// ListApprovedVersions returns approved versions for productID, newest first.
+// limit <= 0 means no limit.
+func (s *Store) ListApprovedVersions(ctx context.Context, productID domain.ID, limit int) ([]*domain.ApprovedVersion, error) {
+	if productID == "" {
+		return nil, storage.ErrInvalidArgument
+	}
+	q := `
+SELECT ` + approvedVersionColumns + `
+  FROM approved_versions
+ WHERE product_id = $1
+ ORDER BY sequence DESC
+`
+	args := []any{string(productID)}
+	if limit > 0 {
+		args = append(args, limit)
+		q += " LIMIT $2"
+	}
+	rows, err := s.q.Query(ctx, q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: list approved_versions: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]*domain.ApprovedVersion, 0)
+	for rows.Next() {
+		av, err := scanApprovedVersion(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, av)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("postgres: iterate approved_versions: %w", err)
+	}
+	return out, nil
+}
+
+// NextSequenceForProduct returns max(sequence)+1, or 1 if there is no prior
+// version. Concurrency is resolved by the unique (product_id, sequence)
+// constraint at insert time; callers retry on storage.ErrAlreadyExists.
+func (s *Store) NextSequenceForProduct(ctx context.Context, productID domain.ID) (int64, error) {
+	if productID == "" {
+		return 0, storage.ErrInvalidArgument
+	}
+	const q = `SELECT COALESCE(MAX(sequence), 0) + 1 FROM approved_versions WHERE product_id = $1`
+	var next int64
+	if err := s.q.QueryRow(ctx, q, string(productID)).Scan(&next); err != nil {
+		return 0, fmt.Errorf("postgres: next sequence: %w", err)
+	}
+	return next, nil
+}
+
+func (s *Store) getSnapshotByID(ctx context.Context, id domain.ID) (*domain.ApprovedVersionSnapshot, error) {
+	const q = `SELECT ` + approvedVersionSnapshotColumns + ` FROM approved_version_snapshots WHERE id = $1`
+	return scanApprovedVersionSnapshot(s.q.QueryRow(ctx, q, string(id)))
+}
+
+func scanApprovedVersion(r scannable) (*domain.ApprovedVersion, error) {
+	var (
+		id, productID, sourceCS, snapshotID string
+		parentVersionID                     *string
+		sequence                            int64
+		approvedByKind, approvedBySubj      string
+		description                         string
+		createdAt                           time.Time
+	)
+	err := r.Scan(
+		&id, &productID, &sequence, &parentVersionID, &sourceCS, &snapshotID,
+		&approvedByKind, &approvedBySubj, &description, &createdAt,
+	)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, storage.ErrNotFound
+		}
+		return nil, fmt.Errorf("postgres: scan approved_version: %w", err)
+	}
+	return &domain.ApprovedVersion{
+		ID:                domain.ID(id),
+		ProductID:         domain.ID(productID),
+		Sequence:          sequence,
+		ParentVersionID:   nullableID(parentVersionID),
+		SourceChangeSetID: domain.ID(sourceCS),
+		SnapshotID:        domain.ID(snapshotID),
+		ApprovedBy: domain.Actor{
+			Kind:    domain.ActorKind(approvedByKind),
+			Subject: approvedBySubj,
+		},
+		Description: description,
+		CreatedAt:   createdAt,
+	}, nil
+}
+
+func scanApprovedVersionSnapshot(r scannable) (*domain.ApprovedVersionSnapshot, error) {
+	var (
+		id, contentHash string
+		contentRaw      []byte
+		createdAt       time.Time
+	)
+	err := r.Scan(&id, &contentRaw, &contentHash, &createdAt)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, storage.ErrNotFound
+		}
+		return nil, fmt.Errorf("postgres: scan approved_version_snapshot: %w", err)
+	}
+	snap := &domain.ApprovedVersionSnapshot{
+		ID:          domain.ID(id),
+		ContentHash: contentHash,
+		CreatedAt:   createdAt,
+	}
+	if len(contentRaw) > 0 {
+		if err := json.Unmarshal(contentRaw, &snap.Content); err != nil {
+			return nil, fmt.Errorf("postgres: decode approved_version_snapshot content: %w", err)
+		}
+	}
+	return snap, nil
 }
 
 // joinAnd joins SQL fragments with " AND " without pulling in strings.Join uses

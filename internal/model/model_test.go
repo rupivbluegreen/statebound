@@ -1,12 +1,14 @@
 package model_test
 
 import (
+	"encoding/json"
 	"reflect"
 	"strings"
 	"testing"
 
 	"gopkg.in/yaml.v3"
 
+	"statebound.dev/statebound/internal/domain"
 	"statebound.dev/statebound/internal/model"
 )
 
@@ -313,5 +315,168 @@ func TestRoundTrip_YAMLOnly(t *testing.T) {
 	}
 	if !reflect.DeepEqual(doc1, doc2) {
 		t.Fatalf("round-trip mismatch\nfirst:\n%+v\nsecond:\n%+v\nyaml:\n%s", doc1, doc2, string(out))
+	}
+}
+
+// loadValid returns a fresh copy of the §20 example for diff tests.
+func loadValid(t *testing.T) *model.ProductAuthorizationModel {
+	t.Helper()
+	var doc model.ProductAuthorizationModel
+	if err := yaml.Unmarshal([]byte(validYAML), &doc); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	return &doc
+}
+
+func TestComputeDiff_EmptyVsEmpty(t *testing.T) {
+	d, err := model.ComputeDiff(nil, nil)
+	if err != nil {
+		t.Fatalf("ComputeDiff: %v", err)
+	}
+	if !d.IsEmpty() {
+		t.Fatalf("expected empty diff, got %d items", len(d.Items))
+	}
+}
+
+func TestComputeDiff_FullAdd(t *testing.T) {
+	after := loadValid(t)
+	d, err := model.ComputeDiff(nil, after)
+	if err != nil {
+		t.Fatalf("ComputeDiff: %v", err)
+	}
+	if d.IsEmpty() {
+		t.Fatalf("expected non-empty diff")
+	}
+	for _, it := range d.Items {
+		if it.Action != domain.ChangeSetActionAdd {
+			t.Errorf("item %q: action=%s, want add", it.ResourceName, it.Action)
+		}
+		if it.Before != nil {
+			t.Errorf("item %q: before should be nil for add", it.ResourceName)
+		}
+		if it.After == nil {
+			t.Errorf("item %q: after must be set for add", it.ResourceName)
+		}
+	}
+	// Ensure product comes first and is the very first item.
+	if len(d.Items) == 0 || d.Items[0].Kind != domain.ChangeSetItemKindProduct {
+		t.Fatalf("first item should be product; got %+v", d.Items[0])
+	}
+}
+
+func TestComputeDiff_FullDelete(t *testing.T) {
+	before := loadValid(t)
+	d, err := model.ComputeDiff(before, nil)
+	if err != nil {
+		t.Fatalf("ComputeDiff: %v", err)
+	}
+	if d.IsEmpty() {
+		t.Fatalf("expected non-empty diff")
+	}
+	for _, it := range d.Items {
+		if it.Action != domain.ChangeSetActionDelete {
+			t.Errorf("item %q: action=%s, want delete", it.ResourceName, it.Action)
+		}
+		if it.After != nil {
+			t.Errorf("item %q: after should be nil for delete", it.ResourceName)
+		}
+		if it.Before == nil {
+			t.Errorf("item %q: before must be set for delete", it.ResourceName)
+		}
+	}
+}
+
+func TestComputeDiff_NoChange(t *testing.T) {
+	a := loadValid(t)
+	b := loadValid(t)
+	d, err := model.ComputeDiff(a, b)
+	if err != nil {
+		t.Fatalf("ComputeDiff: %v", err)
+	}
+	if !d.IsEmpty() {
+		t.Fatalf("expected empty diff, got %d items: %+v", len(d.Items), d.Items)
+	}
+}
+
+func TestComputeDiff_SingleEdit(t *testing.T) {
+	before := loadValid(t)
+	after := loadValid(t)
+	after.Spec.Entitlements[0].Purpose = "Edited purpose"
+
+	d, err := model.ComputeDiff(before, after)
+	if err != nil {
+		t.Fatalf("ComputeDiff: %v", err)
+	}
+	if len(d.Items) != 1 {
+		t.Fatalf("expected exactly 1 diff item, got %d: %+v", len(d.Items), d.Items)
+	}
+	got := d.Items[0]
+	if got.Kind != domain.ChangeSetItemKindEntitlement {
+		t.Errorf("kind = %s, want entitlement", got.Kind)
+	}
+	if got.Action != domain.ChangeSetActionUpdate {
+		t.Errorf("action = %s, want update", got.Action)
+	}
+	wantRes := "entitlement:" + before.Spec.Entitlements[0].Name
+	if got.ResourceName != wantRes {
+		t.Errorf("resource = %q, want %q", got.ResourceName, wantRes)
+	}
+	if got.Before["purpose"] != before.Spec.Entitlements[0].Purpose {
+		t.Errorf("before.purpose = %v, want %q", got.Before["purpose"], before.Spec.Entitlements[0].Purpose)
+	}
+	if got.After["purpose"] != "Edited purpose" {
+		t.Errorf("after.purpose = %v, want %q", got.After["purpose"], "Edited purpose")
+	}
+}
+
+func TestComputeDiff_Determinism(t *testing.T) {
+	a := loadValid(t)
+	b := loadValid(t)
+	b.Metadata.Owner = "new-owner"
+	b.Spec.Assets[0].Description = "edited"
+
+	d1, err := model.ComputeDiff(a, b)
+	if err != nil {
+		t.Fatalf("first ComputeDiff: %v", err)
+	}
+	d2, err := model.ComputeDiff(a, b)
+	if err != nil {
+		t.Fatalf("second ComputeDiff: %v", err)
+	}
+	j1, err := json.Marshal(d1.Items)
+	if err != nil {
+		t.Fatalf("marshal d1: %v", err)
+	}
+	j2, err := json.Marshal(d2.Items)
+	if err != nil {
+		t.Fatalf("marshal d2: %v", err)
+	}
+	if string(j1) != string(j2) {
+		t.Fatalf("non-deterministic output:\n%s\nvs\n%s", j1, j2)
+	}
+}
+
+func TestSnapshotRoundTrip(t *testing.T) {
+	original := loadValid(t)
+	content, err := model.ToSnapshotContent(original)
+	if err != nil {
+		t.Fatalf("ToSnapshotContent: %v", err)
+	}
+	restored, err := model.FromSnapshot(content)
+	if err != nil {
+		t.Fatalf("FromSnapshot: %v", err)
+	}
+	c1, err := model.ToSnapshotContent(original)
+	if err != nil {
+		t.Fatalf("ToSnapshotContent (1): %v", err)
+	}
+	c2, err := model.ToSnapshotContent(restored)
+	if err != nil {
+		t.Fatalf("ToSnapshotContent (2): %v", err)
+	}
+	j1, _ := json.Marshal(c1)
+	j2, _ := json.Marshal(c2)
+	if string(j1) != string(j2) {
+		t.Fatalf("round-trip mismatch:\n%s\nvs\n%s", j1, j2)
 	}
 }

@@ -68,15 +68,33 @@ jobs:
           goose -dir migrations postgres "$STATEBOUND_DB_DSN" up
 
       - name: CLI smoke test
+        env:
+          STATEBOUND_DEV_AUTO_APPROVE: "true"
+          STATEBOUND_ACTOR: ci-bot
         run: |
           ./bin/statebound version
           ./bin/statebound validate -f examples/payments-api/model.yaml
           # bad model must exit non-zero with findings
           ! ./bin/statebound validate -f examples/payments-api/model-bad.yaml
+
+          # Phase 2: import produces a draft change set (no live-table writes)
           ./bin/statebound model import -f examples/payments-api/model.yaml
           ./bin/statebound product list
-          # idempotent re-import must succeed
-          ./bin/statebound model import -f examples/payments-api/model.yaml
+          ./bin/statebound approval list
+
+          # Auto-approve flow for end-to-end (dev-only; gated by env var above)
+          ./bin/statebound model import -f examples/payments-api/model.yaml --auto-approve
+
+          # After auto-approve, an ApprovedVersion exists; export it
           ./bin/statebound model export --product payments-api > /tmp/exported.yaml
           test -s /tmp/exported.yaml
-          ./bin/statebound product create checkout-api --owner alice --description "CI smoke product"
+
+          # Diff against the same YAML must report no changes
+          diff_out=$(./bin/statebound diff --product payments-api -f examples/payments-api/model.yaml)
+          echo "$diff_out" | grep -q "no changes"
+
+          # Audit chain integrity
+          ./bin/statebound audit verify
+
+          # Standalone product create still works
+          ./bin/statebound product create checkout-api --owner ci-bot --description "CI smoke product"

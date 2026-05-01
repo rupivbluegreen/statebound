@@ -4,6 +4,7 @@ package storage
 import (
 	"context"
 	"errors"
+	"time"
 
 	"statebound.dev/statebound/internal/domain"
 )
@@ -104,6 +105,44 @@ type AuthorizationStore interface {
 	DeleteAuthorization(ctx context.Context, id domain.ID) error
 }
 
+// ChangeSetFilter narrows ListChangeSets results. A zero Limit means no limit.
+type ChangeSetFilter struct {
+	ProductID *domain.ID
+	State     *domain.ChangeSetState
+	Limit     int
+}
+
+// ChangeSetStore persists ChangeSets and their items.
+type ChangeSetStore interface {
+	CreateChangeSet(ctx context.Context, cs *domain.ChangeSet) error
+	GetChangeSetByID(ctx context.Context, id domain.ID) (*domain.ChangeSet, error)
+	ListChangeSets(ctx context.Context, filter ChangeSetFilter) ([]*domain.ChangeSet, error)
+	UpdateChangeSetState(ctx context.Context, id domain.ID, newState domain.ChangeSetState, decidedAt *time.Time, decisionReason string) error
+	AppendChangeSetItem(ctx context.Context, item *domain.ChangeSetItem) error
+	ListChangeSetItems(ctx context.Context, csID domain.ID) ([]*domain.ChangeSetItem, error)
+}
+
+// ApprovalStore persists Approval records.
+type ApprovalStore interface {
+	CreateApproval(ctx context.Context, a *domain.Approval) error
+	ListApprovalsByChangeSet(ctx context.Context, csID domain.ID) ([]*domain.Approval, error)
+}
+
+// ApprovedVersionStore persists immutable approved versions and their snapshots.
+type ApprovedVersionStore interface {
+	// CreateApprovedVersion atomically inserts the snapshot and the version that
+	// references it. If snap.ID is already present (same content_hash), the
+	// existing snapshot row is reused; otherwise a new snapshot row is created.
+	CreateApprovedVersion(ctx context.Context, av *domain.ApprovedVersion, snap *domain.ApprovedVersionSnapshot) error
+	GetLatestApprovedVersion(ctx context.Context, productID domain.ID) (*domain.ApprovedVersion, *domain.ApprovedVersionSnapshot, error)
+	GetApprovedVersionByID(ctx context.Context, id domain.ID) (*domain.ApprovedVersion, *domain.ApprovedVersionSnapshot, error)
+	ListApprovedVersions(ctx context.Context, productID domain.ID, limit int) ([]*domain.ApprovedVersion, error)
+	// NextSequenceForProduct returns max(sequence)+1, or 1 if no prior version.
+	// The unique constraint on (product_id, sequence) is the source of truth for
+	// concurrency; callers retry on ErrAlreadyExists.
+	NextSequenceForProduct(ctx context.Context, productID domain.ID) (int64, error)
+}
+
 // Storage is the aggregate persistence boundary used by the application layer.
 type Storage interface {
 	ProductStore
@@ -114,6 +153,9 @@ type Storage interface {
 	ServiceAccountStore
 	GlobalObjectStore
 	AuthorizationStore
+	ChangeSetStore
+	ApprovalStore
+	ApprovedVersionStore
 	Close(ctx context.Context) error
 	Ping(ctx context.Context) error
 	// WithTx runs fn inside a database transaction. The Storage handed to fn issues

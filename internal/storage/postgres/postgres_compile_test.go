@@ -17,14 +17,17 @@ func TestStoreImplementsStorage(t *testing.T) {
 // broad "does not implement Storage" message.
 func TestStoreSubInterfaces(t *testing.T) {
 	var (
-		_ storage.ProductStore        = (*postgres.Store)(nil)
-		_ storage.AuditStore          = (*postgres.Store)(nil)
-		_ storage.AssetStore          = (*postgres.Store)(nil)
-		_ storage.AssetScopeStore     = (*postgres.Store)(nil)
-		_ storage.EntitlementStore    = (*postgres.Store)(nil)
-		_ storage.ServiceAccountStore = (*postgres.Store)(nil)
-		_ storage.GlobalObjectStore   = (*postgres.Store)(nil)
-		_ storage.AuthorizationStore  = (*postgres.Store)(nil)
+		_ storage.ProductStore         = (*postgres.Store)(nil)
+		_ storage.AuditStore           = (*postgres.Store)(nil)
+		_ storage.AssetStore           = (*postgres.Store)(nil)
+		_ storage.AssetScopeStore      = (*postgres.Store)(nil)
+		_ storage.EntitlementStore     = (*postgres.Store)(nil)
+		_ storage.ServiceAccountStore  = (*postgres.Store)(nil)
+		_ storage.GlobalObjectStore    = (*postgres.Store)(nil)
+		_ storage.AuthorizationStore   = (*postgres.Store)(nil)
+		_ storage.ChangeSetStore       = (*postgres.Store)(nil)
+		_ storage.ApprovalStore        = (*postgres.Store)(nil)
+		_ storage.ApprovedVersionStore = (*postgres.Store)(nil)
 	)
 	_ = t
 }
