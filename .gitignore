@@ -51,7 +51,6 @@ internal/authz/bundle/*.rego
 /.claude/
 /.remember/
 
-# ADRs and the operating manual are kept locally but not tracked publicly
-# until trademark clearance (per the project's rename rationale).
-/docs/adr/
-/CLAUDE.md
+# (ADRs and CLAUDE.md were tracked in v1.0 once the spec stabilised. They
+# previously lived locally during the rename / anonymisation pass — see the
+# CHANGELOG for that history.)
