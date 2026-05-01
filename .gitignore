@@ -15,6 +15,10 @@ coverage.txt
 /.gocache/
 /.gomodcache/
 
+# Go toolchain local telemetry — written by the Docker-wrapped go binary
+# when HOME is set inside the container; not project state.
+/.config/
+
 # Local docker-compose volumes / overrides.
 /deploy/docker-compose/.data/
 /deploy/docker-compose/docker-compose.override.yml
