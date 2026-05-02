@@ -31,18 +31,17 @@ service:
 api:
   # Bind address inside the container. Leading colon = all interfaces.
   listen: ":8080"
-  readTimeout: "15s"
-  writeTimeout: "30s"
-  logLevel: "info"
+  # readTimeout / writeTimeout / logLevel are CLI flags on
+  # `statebound api serve`; once the chart wires args these will
+  # surface as Helm values. For v1.0.1 they are intentionally not
+  # in the rendered ConfigMap (the binary does not read them as env
+  # vars). Tracked as a v1.x enhancement.
 
   # OIDC bearer-token auth. Set issuer + audience to enable. When both
   # are empty the chart requires devToken to be set instead.
   oidc:
     issuer: ""
     audience: ""
-    # Optional: JWKS URL override. By default the binary discovers
-    # JWKS from {issuer}/.well-known/openid-configuration.
-    jwksURL: ""
 
   # Dev-token auth. Accepts a single bearer token; every request
   # authenticated with it acts as devActor. This is appropriate for
@@ -88,13 +87,16 @@ migrations:
   hookWeight: "-5"
 
 # OpenTelemetry tracing. OFF by default. Set exporter to
-# "otlp-grpc", "otlp-http", or "stdout" to enable.
+# "otlp-grpc", "otlp-http", or "stdout" to enable. The sampler
+# values mirror STATEBOUND_OTEL_SAMPLER on the binary: "" (parent-
+# based always-on), "always", "never", or "ratio:N" (e.g.
+# "ratio:0.1" for 10% sampling).
 telemetry:
   exporter: ""
   endpoint: ""
   insecure: true
   serviceName: "statebound"
-  sampleRatio: ""
+  sampler: ""
 
 # Plan-bundle signing. v1.0 emits Ed25519-signed plan bundles. The
 # private key never enters the chart; operators provide a secret

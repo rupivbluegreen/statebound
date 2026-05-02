@@ -7,18 +7,15 @@ metadata:
   labels:
     {{- include "statebound.labels" . | nindent 4 }}
 data:
+  # Every key below corresponds to an env var the statebound binary
+  # actually reads. Adding a key the binary does not read is a chart
+  # bug (silently misconfigures operators).
   STATEBOUND_API_LISTEN: {{ .Values.api.listen | quote }}
-  STATEBOUND_API_READ_TIMEOUT: {{ .Values.api.readTimeout | quote }}
-  STATEBOUND_API_WRITE_TIMEOUT: {{ .Values.api.writeTimeout | quote }}
-  STATEBOUND_LOG_LEVEL: {{ .Values.api.logLevel | quote }}
   {{- with .Values.api.oidc.issuer }}
-  STATEBOUND_OIDC_ISSUER: {{ . | quote }}
+  STATEBOUND_API_OIDC_ISSUER: {{ . | quote }}
   {{- end }}
   {{- with .Values.api.oidc.audience }}
-  STATEBOUND_OIDC_AUDIENCE: {{ . | quote }}
-  {{- end }}
-  {{- with .Values.api.oidc.jwksURL }}
-  STATEBOUND_OIDC_JWKS_URL: {{ . | quote }}
+  STATEBOUND_API_OIDC_AUDIENCE: {{ . | quote }}
   {{- end }}
   {{- with .Values.api.devActor }}
   STATEBOUND_DEV_ACTOR: {{ . | quote }}
@@ -33,8 +30,8 @@ data:
   {{- with .Values.telemetry.serviceName }}
   STATEBOUND_OTEL_SERVICE_NAME: {{ . | quote }}
   {{- end }}
-  {{- with .Values.telemetry.sampleRatio }}
-  STATEBOUND_OTEL_SAMPLE_RATIO: {{ . | quote }}
+  {{- with .Values.telemetry.sampler }}
+  STATEBOUND_OTEL_SAMPLER: {{ . | quote }}
   {{- end }}
   {{- with .Values.signing.keyId }}
   STATEBOUND_SIGNING_KEY_ID: {{ . | quote }}
@@ -45,6 +42,9 @@ data:
   {{- if .Values.database.dsn }}
   STATEBOUND_DB_DSN: {{ .Values.database.dsn | quote }}
   {{- else }}
+  # The migration Job composes a DSN from these parts in shell; the
+  # API pod relies on the operator providing database.dsn directly
+  # (no Postgres-secret mount on the API pod by default).
   STATEBOUND_DB_HOST: {{ .Values.database.host | quote }}
   STATEBOUND_DB_PORT: {{ .Values.database.port | quote }}
   STATEBOUND_DB_NAME: {{ .Values.database.database | quote }}
