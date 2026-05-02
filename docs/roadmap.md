@@ -3,7 +3,7 @@
 Statebound releases as **two independent products** on **independent
 cadences**. The deterministic core ships first and is usable on its
 own. The reasoning add-on is optional and gated on core ≥ v0.3. This
-doc is a distilled view of `the project spec` §29 — see that section for the
+doc is a distilled view of `CLAUDE.md` §29 — see that section for the
 authoritative phase definitions.
 
 ## Core releases (`statebound`, v0.1 → v1.0)

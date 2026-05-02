@@ -1,10 +1,11 @@
 # Golden path demo (v1.0)
 
-The deterministic core demo from the project spec §30, end to end.
-This is the eight-step walk that exercises every Phase 1–8 capability
-against the local stack: bring up Postgres, mint a signing key, import
-a model, watch OPA evaluate it, generate a deterministic plan, export
-an evidence pack, verify the audit chain.
+The deterministic core demo from `CLAUDE.md` §30, end to end. The
+narrative in `CLAUDE.md` §30 has twelve numbered steps; this doc
+compresses them into eight shell commands that exercise every Phase
+1–8 capability against the local stack: bring up Postgres, mint a
+signing key, import a model, watch OPA evaluate it, generate a
+deterministic plan, export an evidence pack, verify the audit chain.
 
 ```bash
 # 1. Bring up local Postgres + apply migrations.

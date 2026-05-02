@@ -46,10 +46,11 @@ long version, including how it compares to those.
   approved versions, hash-chained audit log (the SQL function
   `audit_event_hash()` is the single source of truth, and
   `statebound audit verify` walks the chain).
-- **OPA + Rego built-in rule library** — eight rules out of the box
+- **OPA + Rego built-in rule library** — nine rules out of the box
   (wildcard sudo, root-equiv, prod-requires-approval, four-eyes,
   service-account / entitlement metadata, scope-nonempty,
-  unapproved-apply), 41 unit tests, plus `statebound policy test/eval`.
+  unapproved-apply, RBAC capability check), 41 unit tests, plus
+  `statebound policy test/eval`.
 - **Evidence engine** — deterministic JSON + auditor-friendly
   Markdown. Re-export the same approved version, get byte-identical
   bytes, get the same SHA-256.

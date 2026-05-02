@@ -55,10 +55,10 @@ Statebound's trust boundaries are:
   (`/healthz`, `/readyz`, `/openapi.yaml`) are explicitly allowlisted.
 - All state transitions go through `internal/api`; OPA evaluates every
   request, and decision logs are mirrored into `audit_events` with
-  stable cross-references (the project spec §13).
+  stable cross-references (CLAUDE.md §13).
 - The `apply` and `approve` endpoints are unreachable to any
   ServiceAccount whose entitlements deny them — enforced in OPA, not
-  just absent in code (the project spec §22).
+  just absent in code (CLAUDE.md §22).
 - v1.0 ships at parity: OIDC bearer auth + dev-token mode, plus
   signed plan bundles. Plans submitted to `apply` carry an Ed25519
   signature whose public key is registered via a ChangeSet and whose
@@ -83,15 +83,15 @@ Statebound's trust boundaries are:
 
 - `audit_events` is append-only with a SHA-256 hash chain
   (`current_event_hash = SHA256(previous_event_hash || canonical_json(event))`,
-  the project spec §13). The chain is computed in a SQL function
+  CLAUDE.md §13). The chain is computed in a SQL function
   (`audit_event_hash()`) and verified by `statebound audit verify`.
   A privileged operator who deletes or modifies a row breaks the
   chain at the next verification.
 - `approved_version_snapshots` stores the full model as JSONB and is
   immutable by domain rule. Any change creates a new draft and a new
-  approved version (the project spec §2 principle 5).
+  approved version (CLAUDE.md §2 principle 5).
 - Statebound never stores secrets. Secret managers are referenced, not
-  copied (the project spec §2 principle 7, §22). YAML import validation
+  copied (CLAUDE.md §2 principle 7, §22). YAML import validation
   refuses fields that look like inline credentials and emits clear
   errors.
 - Plan public keys are stored in `signing_keys`; private keys never
@@ -116,7 +116,7 @@ Statebound's trust boundaries are:
 - Four-eyes is enforced both in domain code and in the
   `four_eyes` Rego rule. The submitter and approver must be different
   identities; OPA returns deny if they match.
-- `role:manage` requires the `admin` role in
+- `rbac:manage` requires the `admin` role in
   `domain.RolesForCapability`. Both the Go pre-check
   (`requireCapability`) and the `rbac_role_required` Rego rule consult
   the same mapping, so a UI-bypass attempt fails identically.
@@ -201,18 +201,18 @@ it ships in `statebound-reason` v0.1+.
 
 - Agents are bounded ServiceAccounts. Every tool call is OPA-evaluated
   against the agent's entitlements and recorded in `tool_calls`
-  (the project spec §17).
+  (CLAUDE.md §17).
 - Agents have no `approve` or `apply` scope, enforced at OPA, not just
-  absent in code (the project spec §22).
+  absent in code (CLAUDE.md §22).
 - Prompt bundles are content-addressed, signed at release, and refuse
-  to load if unsigned in production mode (the project spec §17, §22).
+  to load if unsigned in production mode (CLAUDE.md §17, §22).
 - Cloud inference backends require per-agent policy approval; local
-  inference is the default (the project spec §2 principle 13, §22).
+  inference is the default (CLAUDE.md §2 principle 13, §22).
 - Every invocation produces an evidence-grade record (model id,
   prompt hash, input hash, output hash, tool-call trace, OPA
-  decisions) — the project spec §14.
+  decisions) — CLAUDE.md §14.
 - Inputs and outputs are redacted before hashing where policy
-  requires; redactions are documented (the project spec §22).
+  requires; redactions are documented (CLAUDE.md §22).
 
 ## 7. Build and release
 
@@ -271,11 +271,11 @@ These are tracked for the v1.x security review.
 
 ## References
 
-- the project spec §13 — audit log rules.
-- the project spec §14 — agent invocation provenance.
-- the project spec §16 — connector contract.
-- the project spec §17 — reasoning add-on contracts.
-- the project spec §22 — security requirements.
-- the project spec §23 — EU AI Act and agent provenance.
+- CLAUDE.md §13 — audit log rules.
+- CLAUDE.md §14 — agent invocation provenance.
+- CLAUDE.md §16 — connector contract.
+- CLAUDE.md §17 — reasoning add-on contracts.
+- CLAUDE.md §22 — security requirements.
+- CLAUDE.md §23 — EU AI Act and agent provenance.
 - `docs/security-model.md` — the security pillars summarized.
 - `deploy/helm/statebound/README.md` — chart-level guarantees.

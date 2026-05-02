@@ -1,7 +1,7 @@
 # Architecture
 
 This document is a one-page summary. The authoritative source is
-`the project spec` — see specifically §6 (architecture), §7 (stack), §8
+`CLAUDE.md` — see specifically §6 (architecture), §7 (stack), §8
 (layout), §16 (connector contract), and §17 (reasoning contracts).
 
 ## Three planes, hard boundaries
@@ -16,14 +16,14 @@ Statebound is structured as three planes with strict interfaces:
 - **Connector Plane.** The only plane that touches target systems.
   Connectors translate desired state into target-system Plans and
   Applies, and collect actual state for drift comparison. Connector
-  failures cannot corrupt the core model. See `the project spec` §16 for the
+  failures cannot corrupt the core model. See `CLAUDE.md` §16 for the
   interface.
 - **Reasoning Plane.** Bounded AI agents that propose, classify, and
   narrate. They never decide. The Reasoning Plane has no privileged
   access; it interacts with the Decision Plane through the same public
   HTTP/JSON API exposed to humans, scoped by per-agent ServiceAccount
   entitlements. Every interaction is OPA-evaluated and audited
-  identically to a human action. See `the project spec` §17 for the agent and
+  identically to a human action. See `CLAUDE.md` §17 for the agent and
   inference-backend contracts.
 
 ## Two deployment artifacts
@@ -81,23 +81,23 @@ impractical (e.g., a connector for a system with only a Python SDK).
 Cobra for CLI, Bubble Tea + Lip Gloss + Bubbles for TUI, chi or stdlib
 for HTTP, OpenAPI 3.1 for the API spec, PostgreSQL with Goose for
 migrations, sqlc with pgx for SQL access, OPA / Rego as the primary
-policy engine, slog for logging. See `the project spec` §7 for full details.
+policy engine, slog for logging. See `CLAUDE.md` §7 for full details.
 
 ## Layout
 
 The core repository layout is summarized in the README and detailed in
-`the project spec` §8. The hard rule: domain logic stays separate from API,
+`CLAUDE.md` §8. The hard rule: domain logic stays separate from API,
 CLI, TUI, connectors, and reasoning. The Reasoning Plane talks to the
 Decision Plane through `internal/api`, never directly to
 `internal/domain` or `internal/storage`.
 
 ## Cross-references
 
-- `the project spec` §6 — three-plane architecture and deployment shapes.
-- `the project spec` §7 — recommended technical stack.
-- `the project spec` §8 — repository layout and boundary rules.
-- `the project spec` §16 — connector contract.
-- `the project spec` §17 — agent runtime, inference backend, tool dispatch,
+- `CLAUDE.md` §6 — three-plane architecture and deployment shapes.
+- `CLAUDE.md` §7 — recommended technical stack.
+- `CLAUDE.md` §8 — repository layout and boundary rules.
+- `CLAUDE.md` §16 — connector contract.
+- `CLAUDE.md` §17 — agent runtime, inference backend, tool dispatch,
   prompt bundle contracts.
 - `docs/adr/0001-reasoning-as-addon.md` — the add-on separation
   decision record.

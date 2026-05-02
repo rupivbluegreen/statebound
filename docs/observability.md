@@ -7,10 +7,9 @@ set, the SDK installs a no-op tracer and the per-span overhead in the
 CLI hot paths is one nil-method call. Operators opt in by setting the
 exporter env var; everything else has a sensible default.
 
-This document covers wave A (v0.7), which ships **traces only**.
-Metrics (Prometheus exporter, RED counters, host-process metrics)
-arrive in wave C alongside `otel-pgx` for storage-layer
-instrumentation.
+v1.0 ships **traces only**. Metrics (Prometheus exporter, RED
+counters, host-process metrics) and storage-layer pgx instrumentation
+(`otel-pgx`) are deferred to a future v1.x release.
 
 ## What is traced
 
@@ -31,8 +30,10 @@ finding bodies — none of those flow into span attributes.
 
 ## What is NOT traced (yet)
 
-- Storage-layer pgx queries (wave C).
-- HTTP server endpoints (no HTTP server in core yet).
+- Storage-layer pgx queries (deferred to a future v1.x release).
+- HTTP API endpoints (the v1.0 `statebound api serve` middleware
+  records request-id + slog access logs but does not yet emit OTel
+  spans for inbound HTTP requests; planned for a future v1.x).
 - Connector internals (deliberate — keeps the connector contract
   observability-agnostic).
 - The reasoning add-on. Agent invocations are traced separately by
@@ -97,8 +98,8 @@ chosen to be **low-cardinality** so a future metrics layer can reuse
 them as labels without explosion. UUID-shaped attributes
 (`statebound.plan_id`, `statebound.change_set_id`, etc.) are present
 on spans for debuggability but **must not become metric labels** when
-wave C lands; switch to enums (e.g. policy outcome) for metric
-dimensions.
+the future metrics layer lands; switch to enums (e.g. policy outcome)
+for metric dimensions.
 
 | Attribute | Cardinality | Notes |
 |-----------|-------------|-------|
@@ -139,8 +140,8 @@ their content hashes (`statebound.plan_content_hash`,
 
 ## References
 
-- the project spec §7 — recommended technical stack: "OpenTelemetry-ready, optional in MVP".
-- the project spec §22 — security requirements (no secrets in logs).
-- the project spec §28 — definition of done for instrumented features.
+- CLAUDE.md §7 — recommended technical stack: "OpenTelemetry-ready, optional in MVP".
+- CLAUDE.md §22 — security requirements (no secrets in logs).
+- CLAUDE.md §28 — definition of done for instrumented features.
 - `internal/telemetry/` — implementation.
 - `cmd/statebound/main.go` — process-level wiring.

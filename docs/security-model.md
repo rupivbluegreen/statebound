@@ -1,7 +1,7 @@
 # Security Model
 
 This document summarizes the security pillars that Statebound is built
-around. The authoritative list of requirements is the project spec §22;
+around. The authoritative list of requirements is CLAUDE.md §22;
 this document gives a paragraph of context per pillar so contributors
 can reason about why a given rule exists. Phase 8 wave C consolidated
 the v1.0 picture: the pillars below describe what a v1.0 deployment
@@ -14,7 +14,7 @@ four-eyes approval and OPA evaluation. It is immutable by domain rule:
 any change creates a new draft, change set, or version. Apply
 operations target an approved version, never a draft. This is what
 makes Statebound replayable and what gives auditors a stable artifact
-to point at. See the project spec §2 principles 3 and 5, §22.
+to point at. See CLAUDE.md §2 principles 3 and 5, §22.
 
 ## Four-eyes approval
 
@@ -22,7 +22,7 @@ Submitter and approver must be different identities in four-eyes mode.
 The rule is enforced by OPA, not just by UI affordance, so it cannot
 be bypassed by a direct API call. Elevated approval applies for
 high-risk changes (root-equivalent authorizations, wildcard sudo,
-production scopes). See the project spec §15.
+production scopes). See CLAUDE.md §15.
 
 ## OPA as the sole policy gate
 
@@ -34,7 +34,7 @@ can reproduce the verdict that gated each transition. Built-in Rego
 rules ship in `policies/builtin/`; custom rules are authored by the
 operator. The Rego bundle is embedded into the binary via `go:embed`,
 so an attacker cannot swap in a permissive rule by writing to the
-container's filesystem. See the project spec §13, §15.
+container's filesystem. See CLAUDE.md §13, §15.
 
 ## Append-only, hash-chained audit log
 
@@ -45,7 +45,7 @@ This makes silent tampering detectable: any inserted, deleted, or
 modified row breaks the chain at the verification step
 (`statebound audit verify`). OPA decision logs are mirrored into this
 stream so that policy verdicts and product state share one tamper-
-evident timeline. See the project spec §13, §22.
+evident timeline. See CLAUDE.md §13, §22.
 
 ## No secret storage
 
@@ -57,7 +57,7 @@ compliance story. The same rule extends to evidence packs and agent
 invocation records: redact before hashing if a secret might appear
 in inputs or outputs, and document the redaction. The Helm chart
 mirrors this rule — it accepts secret *references* (`passwordSecretRef`,
-`privateKeySecretRef`) and never inlines values. See the project spec
+`privateKeySecretRef`) and never inlines values. See CLAUDE.md
 §2 principle 7, §22.
 
 ## Connector least privilege
@@ -67,7 +67,7 @@ target-system privilege required to plan, apply, or collect actual
 state. Network egress is opt-in and policy-gated. Connector failures
 must not corrupt the core model — connectors do not own domain
 objects, they only translate. Every connector ships with dry-run
-tests. See the project spec §2 principle 9, §16, §22.
+tests. See CLAUDE.md §2 principle 9, §16, §22.
 
 ## Agent self-governance
 
@@ -80,7 +80,7 @@ OPA, not just absent in code. Cloud inference backends require
 per-agent policy approval. Prompt bundles are signed in production
 mode. Every invocation produces an evidence-grade provenance record.
 This is what makes the AI layer audit-defensible and what makes the
-self-governance claim honest. See the project spec §2 principles 11–14,
+self-governance claim honest. See CLAUDE.md §2 principles 11–14,
 §14, §17, §19, §22.
 
 ## Operator RBAC (Phase 8 wave A)
@@ -144,10 +144,11 @@ The HTTP API authenticates every request via the
 `internal/api/middleware.go` bearer-auth pipeline. Two authentication
 modes are supported, mutually exclusive at deployment time:
 
-1. **OIDC.** `STATEBOUND_OIDC_ISSUER` + `STATEBOUND_OIDC_AUDIENCE`
-   enable OIDC discovery, JWKS fetch, and per-request signature +
-   expiry + audience validation. The actor identity comes from the
-   token's `sub` claim. This is the production path.
+1. **OIDC.** `STATEBOUND_API_OIDC_ISSUER` +
+   `STATEBOUND_API_OIDC_AUDIENCE` enable OIDC discovery, JWKS fetch,
+   and per-request signature + expiry + audience validation. The
+   actor identity comes from the token's `sub` claim. This is the
+   production path.
 2. **Dev token.** `STATEBOUND_DEV_TOKEN` is a single bearer that
    maps every request to `STATEBOUND_DEV_ACTOR`. Local development
    only. The Helm chart will set this only when no OIDC issuer is
@@ -162,7 +163,7 @@ with `401`.
 OpenTelemetry tracing is OFF by default. Enable it by setting
 `STATEBOUND_OTEL_EXPORTER` to `otlp-grpc`, `otlp-http`, or `stdout`.
 Span attributes are PII-safe by default — actor identity is omitted
-unless the operator opts in via `STATEBOUND_OTEL_ATTR_ACTOR=true`.
+unless the operator opts in via `STATEBOUND_OTEL_INCLUDE_ACTOR=true`.
 This is the same posture documented in `docs/observability.md`. OTel
 init failures never abort the run: observability should never break
 the control plane.
@@ -189,10 +190,10 @@ The v1.0 container and Helm chart enforce these defaults:
 
 ## References
 
-- the project spec §22 — full security requirements list.
-- the project spec §13 — audit log rules.
-- the project spec §14 — agent invocation provenance.
-- the project spec §15 — policy and risk rules.
+- CLAUDE.md §22 — full security requirements list.
+- CLAUDE.md §13 — audit log rules.
+- CLAUDE.md §14 — agent invocation provenance.
+- CLAUDE.md §15 — policy and risk rules.
 - `docs/threat-model.md` — Phase 1–8 threat surfaces and mitigations.
 - `docs/observability.md` — OpenTelemetry tracing posture (off by
   default; PII-safe defaults; opt-in actor attribution).

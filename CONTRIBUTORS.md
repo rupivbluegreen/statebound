@@ -23,5 +23,7 @@ v1.0 hardening (Phase 8 wave C). The work is recorded in
 
 Open a PR against this file with your preferred attribution (name,
 optional link, optional one-line description of contribution).
-External contributors are welcome — see `CONTRIBUTING.md` for the
-process.
+External contributors are welcome — a `CONTRIBUTING.md` with the
+full submission flow lands in v1.0.1; until then, file an issue
+describing the change you want to make and we'll work out the
+specifics in the thread.

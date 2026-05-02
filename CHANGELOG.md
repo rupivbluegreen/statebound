@@ -33,7 +33,7 @@ reasoning add-on can call into.
 - CI: new `docker-build` job builds the image and smoke-tests
   `statebound version` + `statebound --help` inside the container.
 - README: v1.0 status banner plus a step-by-step golden-path demo
-  matching the spec §30.
+  matching `CLAUDE.md` §30.
 - `docs/threat-model.md`: comprehensive rewrite covering every
   Phase 1–8 mitigation (audit forgery, approve-after-self-request,
   wildcard sudo escalation, apply-without-approval, stale-plan apply,
@@ -98,8 +98,10 @@ reasoning add-on can call into.
   approved versions.
 - OPA / Rego built-in rule library:
   `four_eyes`, `wildcard_sudo`, `service_account_metadata`,
-  `entitlement_metadata`, `production_requires_approval`,
-  `prod_scope_nonempty`, `root_equivalent`, `rbac_role_required`.
+  `entitlement_metadata`, `prod_requires_approval`,
+  `scope_nonempty_prod`, `root_equiv`, `unapproved_apply`, plus
+  `rbac` (added in Phase 8 wave A). Each ships with Rego unit tests
+  in `policies/tests/`.
 - Decision-log fan-out: every OPA decision becomes an audit event
   with a stable cross-reference id.
 - Hash-chained `audit_events` (`current_event_hash = SHA256(prev || canonical_json(event))`)
