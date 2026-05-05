@@ -124,4 +124,3 @@ nav:
   - Roadmap: roadmap.md
   - Decision records:
       - 0001 — Reasoning as add-on: adr/0001-reasoning-as-addon.md
-      - 0002 — Product name: adr/0002-product-name-statebound.md
