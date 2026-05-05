@@ -175,8 +175,8 @@ governance rigor they sell to customers.
 
 ## Where to next
 
-- [`README.md`](../README.md) — the short version with the
-  60-second quickstart.
+- [Home](index.md) — the short version with the 60-second
+  quickstart.
 - [`docs/architecture.md`](architecture.md) — three planes, two
   deployment shapes.
 - [`docs/golden-path.md`](golden-path.md) — full eight-step demo.
